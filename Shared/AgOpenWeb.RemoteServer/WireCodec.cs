@@ -19,7 +19,7 @@ public static class WireCodec
     public const byte Scene = 1, Tick = 2, CoverageInit = 3, CoverageCells = 4, Status = 5,
         ControlState = 6, Hello = 7, Config = 8, Profiles = 9, Wizard = 10, NtripProfiles = 11,
         FieldOps = 12, AgShare = 13, AppInfo = 14, FieldTools = 15, RecordedPath = 16, Boundary = 17,
-        Sound = 18, Pong = 19, CoverageEdge = 20, ViewPrefs = 21;
+        Sound = 18, Pong = 19, CoverageEdge = 20, ViewPrefs = 21, Prompt = 22, Toast = 23, DrivePick = 24, HardwareMessage = 25;
 
     /// <summary>One-shot alert: tells the client to play sound effect
     /// <paramref name="effectId"/> (the <c>SoundEffect</c> enum value). Pushed
@@ -33,6 +33,64 @@ public static class WireCodec
         return ms.ToArray();
     }
 
+    /// <summary>The host's pending confirm/error dialog (#109). Re-sent whenever it
+    /// changes and in every client's seed; Kind 0 clears it.</summary>
+    public static byte[] EncodePrompt(PromptDto p)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(Prompt);
+        w.Write(p.Seq);                   // i32
+        w.Write((byte)p.Kind);
+        WriteStr(w, p.Title);
+        WriteStr(w, p.Message);
+        WriteStr(w, p.ConfirmLabel);
+        WriteStr(w, p.CancelLabel);
+        WriteStr(w, p.CheckboxLabel);
+        w.Write((byte)(p.CheckboxChecked ? 1 : 0));
+        return ms.ToArray();
+    }
+
+    /// <summary>One-shot notification text (a refusal or failure, #109). Pushed
+    /// event-driven, like <see cref="EncodeSound"/>; not part of the seed.</summary>
+    /// <summary>Module hardware message (PGN 221, #110): text, seconds, warning.</summary>
+    public static byte[] EncodeHardwareMessage(string text, int seconds, bool warning)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(HardwareMessage);
+        WriteStr(w, text);
+        w.Write(seconds);
+        w.Write((byte)(warning ? 1 : 0));
+        return ms.ToArray();
+    }
+
+    public static byte[] EncodeToast(string message)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(Toast);
+        WriteStr(w, message);
+        return ms.ToArray();
+    }
+
+    /// <summary>One-shot Drive In pick list (#109): the fields within 0.5 km when Drive
+    /// In found more than one (AgOpenGPS FormDrivePicker). Not part of the seed.</summary>
+    public static byte[] EncodeDrivePick(IReadOnlyList<FieldEntryDto> fields)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(DrivePick);
+        w.Write(fields.Count);
+        foreach (var f in fields)
+        {
+            WriteStr(w, f.Name);
+            w.Write(f.DistanceKm);        // f64
+            w.Write(f.AreaHa);            // f64
+        }
+        return ms.ToArray();
+    }
+
     public static byte[] EncodeBoundary(BoundaryDto b)
     {
         using var ms = new MemoryStream();
@@ -43,7 +101,7 @@ public static class WireCodec
         {
             w.Write(it.Index);            // i32
             WriteStr(w, it.BoundaryType);
-            WriteStr(w, it.AreaDisplay);
+            w.Write(it.AreaHa);            // f64 (hectares; the client formats ha/ac)
             w.Write((byte)(it.DriveThru ? 1 : 0));
             w.Write((byte)(it.Hard ? 1 : 0));
         }
@@ -279,6 +337,7 @@ public static class WireCodec
         w.Write(tr.Passes);            // i32
         w.Write((byte)(tr.Display ? 1 : 0));
         w.Write(tr.Line);              // i32
+        w.Write(tr.Width);             // f64 — tram width, m (#110)
         // Machine Control tab.
         var m = c.Machine;
         w.Write((byte)(m.HydraulicLiftEnabled ? 1 : 0));
@@ -361,6 +420,8 @@ public static class WireCodec
         B(w.RtkFixed);
         WriteStr(bw, w.FixLabel);
         bw.Write((float)w.Diameter);
+        WriteStr(bw, w.RecordHint);
+        B(w.CanRecord);
         return ms.ToArray();
     }
 
@@ -455,6 +516,12 @@ public static class WireCodec
         }
         w.Write(s.TramLines.Count);
         foreach (var line in s.TramLines) WritePts(w, line);
+        w.Write(s.RecordedPaths.Count);                           // #110
+        foreach (var line in s.RecordedPaths) WritePts(w, line);
+        w.Write(s.ContourStrips.Count);
+        foreach (var line in s.ContourStrips) WritePts(w, line);
+        WriteOptPts(w, s.ContourRef);
+        w.Write((byte)(s.ContourLocked ? 1 : 0));
 
         return ms.ToArray();
     }
@@ -496,7 +563,7 @@ public static class WireCodec
         w.Write((byte)(t.SectionInHeadland ? 1 : 0));
         w.Write((byte)(t.AutoTrack ? 1 : 0));
         w.Write((byte)t.SkipRows);
-        w.Write((byte)(t.SkipRowsOn ? 1 : 0));
+        w.Write((byte)t.SkipMode); // #111 — skip mode 0/1/2
         w.Write((byte)t.TramMode);
         // Headland-distance HUD.
         w.Write((float)t.HeadlandProximityDistance);
@@ -515,6 +582,13 @@ public static class WireCodec
         w.Write(t.HostMs);           // f64 — host monotonic build time (client interp timeline)
         w.Write((byte)(t.IsYouTurnExecuting ? 1 : 0)); // #50 — mid-turn gate for on-screen buttons
         w.Write(t.PassNumber);       // i32 — guidance pass offset (0 = on reference)
+        w.Write((float)t.NudgeOffset); // f32 — driver-relative nudge (m, +right) — #93 readout
+        w.Write((byte)(t.HasGoal ? 1 : 0)); // #95 — PP goal marker
+        w.Write(t.GoalE);            // f64
+        w.Write(t.GoalN);            // f64
+        w.Write((byte)(t.IsReverse ? 1 : 0)); // #125 — reversing
+        w.Write((byte)(t.ModuleNotSteering ? 1 : 0)); // #126 — engaged but module not steering
+        w.Write((float)t.ChartGpsHeading); // f32 — heading chart GPS fix-to-fix (#111)
         return ms.ToArray();
     }
 
@@ -573,6 +647,10 @@ public static class WireCodec
         w.Write((byte)(s.NtripConnected ? 1 : 0));
         WriteStr(w, s.NtripStatus);
         w.Write(s.NtripBytes);          // f64 (raw bytes; client formats KB)
+        WriteStr(w, s.NtripDestination);
+        w.Write((byte)(s.NtripUnicast ? 1 : 0));
+        w.Write((byte)(s.RtcmBroadcast ? 1 : 0));
+        w.Write((byte)(s.NtripEnabled ? 1 : 0));
         WriteStr(w, s.NtripTestStatus);
         w.Write((byte)(s.SimPanelVisible ? 1 : 0));
         // Field Tools — Offset Fix drift (meters).
@@ -583,6 +661,53 @@ public static class WireCodec
         // Dev diagnostics row (append-only): overlay gate + host control-loop latency.
         w.Write((byte)(s.DevOverlay ? 1 : 0));
         w.Write((float)s.GpsToPgnLatencyMs);
+        // GPS source (append-only, #157): sentence type + Dual-without-dual-heading flag.
+        WriteStr(w, s.GpsSentence);
+        w.Write((byte)(s.DualHeadingMissing ? 1 : 0));
+        // NTRIP RTCM stream (append-only, RTCM plan Phase 5): [u8 present] then totals and
+        // [i32 n][ per type: i32 type, i32 count, f32 every s (NaN = once), f32 last s ].
+        var rtcm = s.NtripRtcm;
+        w.Write((byte)(rtcm != null ? 1 : 0));
+        if (rtcm != null)
+        {
+            w.Write((float)rtcm.SessionSeconds);
+            w.Write((int)Math.Min(rtcm.Messages, int.MaxValue));
+            w.Write((int)Math.Min(rtcm.ChecksumFailures, int.MaxValue));
+            w.Write((int)Math.Min(rtcm.BytesSkipped, int.MaxValue));
+            w.Write((int)Math.Min(rtcm.NotSent, int.MaxValue));
+            w.Write((byte)(rtcm.Unframed ? 1 : 0));
+            w.Write(rtcm.Types.Count);
+            foreach (var t in rtcm.Types)
+            {
+                w.Write(t.Type);
+                w.Write((int)Math.Min(t.Count, int.MaxValue));
+                w.Write((float)t.EverySeconds);
+                w.Write((float)t.LastSeconds);
+            }
+        }
+        // System Data card (append-only): [u8 present] then f32 pitch, yaw rate, IMU / dual /
+        // fix-to-fix heading (NaN = none), rate Hz; i32 missed, rejected;
+        // [u8 n][ per sentence: str type, str text, f32 age s ].
+        var sd = s.SystemData;
+        w.Write((byte)(sd != null ? 1 : 0));
+        if (sd != null)
+        {
+            w.Write((float)sd.Pitch);
+            w.Write((float)sd.YawRate);
+            w.Write((float)sd.ImuHeading);
+            w.Write((float)sd.DualHeading);
+            w.Write((float)sd.FixToFixHeading);
+            w.Write((float)sd.RateHz);
+            w.Write((int)Math.Min(sd.Missed, int.MaxValue));
+            w.Write((int)Math.Min(sd.Rejected, int.MaxValue));
+            w.Write((byte)Math.Min(sd.Sentences.Count, 255));
+            for (int i = 0; i < sd.Sentences.Count && i < 255; i++)
+            {
+                WriteStr(w, sd.Sentences[i].Type);
+                WriteStr(w, sd.Sentences[i].Text);
+                w.Write((float)sd.Sentences[i].AgeSeconds);
+            }
+        }
         return ms.ToArray();
     }
 
@@ -605,13 +730,15 @@ public static class WireCodec
     // Persisted web-camera view, sent once per connection in the seed so the client
     // restores its last tilt+zoom (issue #35). Pitch is RADIANS, zoom is client
     // pixels-per-metre — the client's own camera space, stored verbatim host-side.
-    public static byte[] EncodeViewPrefs(double pitch, double zoom)
+    // Camera follow mode (#176) uses the client's numbering: 0 NorthUp, 1 HeadingUp, 3 Map.
+    public static byte[] EncodeViewPrefs(double pitch, double zoom, int cameraMode)
     {
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms);
         w.Write(ViewPrefs);
         w.Write(pitch); // f64
         w.Write(zoom);  // f64
+        w.Write((byte)cameraMode);
         return ms.ToArray();
     }
 

@@ -85,11 +85,7 @@ public static class PgnBuilder
     ///
     /// When IsInFreeDriveMode is true, overrides speed/status/angle for testing:
     /// - Speed set to 8.0 km/h (fake speed to allow motor operation)
-    /// - Status set to SteerSwitchActive (0x01) + AutoSteerEngaged (0x04)
-    ///   so the firmware/simulator PID actually drives toward the
-    ///   commanded angle. The previous value (0x01 alone) left
-    ///   IsEngaged=false on the receiver, so the wizard's motor ramp
-    ///   commands were silently dropped.
+    /// - Status set to 1 so the firmware drives toward the commanded angle
     /// - SteerAngle from FreeDriveSteerAngle instead of guidance
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -115,11 +111,8 @@ public static class PgnBuilder
             buf[5] = (byte)(freeSpeed & 0xFF);        // low byte
             buf[6] = (byte)(freeSpeed >> 8);          // high byte
 
-            // Status: SteerSwitchActive (0x01) + AutoSteerEngaged (0x04).
-            // The receiver's PID gates on bit 0x04; the lone bit 0x01
-            // alone (former value) was insufficient and left free-drive
-            // commands as no-ops on the simulator.
-            buf[7] = 0x01 | 0x04;
+            // Status 1 = steer (AgOpenGPS: "turn on status to operate").
+            buf[7] = 1;
 
             // Use free drive steer angle instead of guidance angle
             // Little-endian: low byte first
@@ -144,14 +137,12 @@ public static class PgnBuilder
             buf[5] = (byte)(speedInt & 0xFF);         // low byte
             buf[6] = (byte)(speedInt >> 8);           // high byte
 
-            // Status byte
-            byte status = 0;
-            if (state.SteerSwitchActive) status |= 0x01;
-            if (state.WorkSwitchActive) status |= 0x02;
-            if (state.IsAutoSteerEngaged) status |= 0x04;
-            if (state.GpsValid) status |= 0x08;
-            if (state.GuidanceValid) status |= 0x10;
-            buf[7] = status;
+            // Status: 1 = steer, 0 = don't, exactly as AgOpenGPS sends it
+            // (Position.designer.cs). The firmware steers on bit 0 (AiO v26
+            // AutosteerProcessor: status & 0x01; AIO v4: guidanceStatus == 1).
+            // This used to put the module's own echoed steer state in bit 0 and
+            // AgOpenWeb's engage in bit 2, which no firmware reads (#125).
+            buf[7] = (byte)(state.IsAutoSteerEngaged && !state.IsSteerPaused ? 1 : 0);
 
             // Steer angle * 100 (signed, 2 bytes)
             short angleInt = (short)(state.SteerAngle * 100);
@@ -168,10 +159,7 @@ public static class PgnBuilder
             buf[12] = (byte)((state.SectionStates >> 8) & 0xFF);  // Sections 9-16
         }
 
-        // CRC: sum of bytes 2 through 12 (source through last data byte)
-        buf[13] = CalculateCrc(buf, 2, 11);
-
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -225,10 +213,7 @@ public static class PgnBuilder
         buf[11] = (byte)(state.SectionStates & 0xFF);         // Sections 1-8
         buf[12] = (byte)((state.SectionStates >> 8) & 0xFF);  // Sections 9-16
 
-        // CRC
-        buf[13] = CalculateCrc(buf, 2, 11);
-
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -271,10 +256,7 @@ public static class PgnBuilder
         buf[13] = speed;
         buf[14] = speed;
 
-        // CRC: sum of bytes 2 through 14 (source through last data byte)
-        buf[15] = CalculateCrc(buf, 2, 13);
-
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -315,8 +297,7 @@ public static class PgnBuilder
         buf[11] = (byte)Math.Clamp(config.User3Value, 0, 255);
         buf[12] = (byte)Math.Clamp(config.User4Value, 0, 255);
 
-        buf[13] = CalculateCrc(buf, 2, 11);
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -341,8 +322,7 @@ public static class PgnBuilder
             buf[5 + i] = (byte)(i < pins.Length ? pins[i] : 0);
         }
 
-        buf[29] = CalculateCrc(buf, 2, 27);
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -359,28 +339,63 @@ public static class PgnBuilder
         return crc;
     }
 
+    /// <summary>
+    /// Stamp the trailing CRC into a fully-populated packet and return it. The
+    /// last byte is the sum of bytes [2 .. len-2] (source through last data
+    /// byte), matching <see cref="CalculateCrc"/> and PgnMessage.CalculateCRC.
+    /// </summary>
+    /// <remarks>
+    /// Every builder in this class returns through here, so the CRC offset and
+    /// span are derived from the buffer length instead of being hand-written per
+    /// PGN. That removes the failure mode where a packet grows a data byte and
+    /// its checksum keeps summing the old span. Operates in place — safe for the
+    /// pooled buffers the hot-path builders reuse.
+    /// </remarks>
+    private static byte[] WithCrc(byte[] packet)
+    {
+        packet[^1] = CalculateCrc(packet, 2, packet.Length - 3);
+        return packet;
+    }
+
     // ===== Module network config (AgIO parity: FormUDP.cs / UDP.designer.cs) =====
-    // These reproduce AgIO's exact wire bytes so the existing AiO board install
-    // base responds correctly. AgIO hardcodes the trailing CRC byte (0x47) for
-    // the scan (202) and set-subnet (201) packets and the modules validate only
-    // the magic bytes (data[5]/[6]), not the CRC — so we keep 0x47 verbatim.
+    // The layouts below reproduce AgIO's wire format so the existing AiO board
+    // install base responds correctly. AgIO itself leaves a stale placeholder
+    // (0x47) in the trailing CRC slot and never recomputes it — UDP.designer.cs:82
+    // rewrites helloFromAgIO[5] and leaves the checksum untouched. Modules gate on
+    // the header + PGN + magic bytes (data[5]/[6]) and ignore the CRC, which is why
+    // that placeholder has always been accepted. We send a correctly computed CRC
+    // instead: firmware that ignores the byte is unaffected, and firmware that does
+    // verify it now passes rather than relying on luck.
+    //
+    // This is send-side only. Do NOT gate the inbound path on ValidateChecksum:
+    // some modules transmit a placeholder CRC of their own, and rejecting those
+    // packets takes the whole link down.
 
     /// <summary>
     /// Build PGN 202 — "scan request" broadcast that asks every module to reply
-    /// with its IP/subnet (PGN 203). Exact AgIO bytes:
-    /// { 0x80, 0x81, 0x7F, 202, 3, 202, 202, 5, 0x47 }.
+    /// with its IP/subnet (PGN 203). AgIO layout (FormUDP.cs:137) with a computed
+    /// CRC: { 0x80, 0x81, 0x7F, 202, 3, 202, 202, 5, CRC }.
     /// </summary>
     public static byte[] BuildScanRequest()
-        => new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SCAN_REQUEST, 3, 202, 202, 5, 0x47 };
+        => WithCrc(new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SCAN_REQUEST, 3, 202, 202, 5, 0 });
+
+    /// <summary>
+    /// Build PGN 200 — the "hello" packet modules watch for to confirm the host is
+    /// alive. AgIO layout (UDP.designer.cs:76) with a computed CRC:
+    /// { 0x80, 0x81, 0x7F, 200, 3, 56, 0, 0, CRC }.
+    /// </summary>
+    public static byte[] BuildHelloPacket()
+        => WithCrc(new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.HELLO_FROM_AGIO, 3, 56, 0, 0, 0 });
 
     /// <summary>
     /// Build PGN 201 — "set subnet" broadcast. Changes the first three IP octets
     /// (the /24) on ALL modules at once; the host octet is preserved by each
     /// module. There is no per-module selector — this is global, matching AgIO.
-    /// Exact AgIO bytes: { 0x80, 0x81, 0x7F, 201, 5, 201, 201, o1, o2, o3, 0x47 }.
+    /// AgIO layout (FormUDP.cs:19) with a computed CRC:
+    /// { 0x80, 0x81, 0x7F, 201, 5, 201, 201, o1, o2, o3, CRC }.
     /// </summary>
     public static byte[] BuildSubnetChange(byte octet1, byte octet2, byte octet3)
-        => new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SET_SUBNET, 5, 201, 201, octet1, octet2, octet3, 0x47 };
+        => WithCrc(new byte[] { HEADER1, HEADER2, SOURCE, PgnNumbers.SET_SUBNET, 5, 201, 201, octet1, octet2, octet3, 0 });
 
     /// <summary>
     /// Parse a PGN 203 scan reply (13 bytes): module id at [2], full module IP at
@@ -404,18 +419,26 @@ public static class PgnBuilder
     }
 
     /// <summary>
-    /// Validate a received PGN checksum.
+    /// Validate a received PGN checksum using the same rule the send path uses:
+    /// the trailing byte is the sum of bytes [2 .. len-2]. (This previously XOR'd
+    /// bytes [0 .. len-2], which disagreed with every packet this class builds and
+    /// would have rejected all valid traffic.)
+    ///
+    /// Diagnostics only — deliberately NOT wired into the receive path. Real
+    /// modules ship packets carrying a placeholder CRC, so gating inbound handling
+    /// on this would drop legitimate traffic and break communications.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool ValidateChecksum(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 2) return false;
+        // header(2) + source + pgn + len + crc
+        if (data.Length < 6) return false;
 
         int checksumPos = data.Length - 1;
         byte calculated = 0;
-        for (int i = 0; i < checksumPos; i++)
+        for (int i = 2; i < checksumPos; i++)
         {
-            calculated ^= data[i];
+            calculated += data[i];
         }
         return calculated == data[checksumPos];
     }
@@ -460,7 +483,8 @@ public static class PgnBuilder
         buf[8] = (byte)Math.Clamp(config.MinPwm, 1, 50);
 
         // Counts per degree (1-255, sent as-is)
-        buf[9] = (byte)Math.Clamp((int)config.CountsPerDegree, 1, 255);
+        // Round, not truncate: the CPD test can give 110.9, which must go out as 111 (#112).
+        buf[9] = (byte)Math.Clamp((int)Math.Round(config.CountsPerDegree, MidpointRounding.AwayFromZero), 1, 255);
 
         // WAS offset (signed 16-bit, little-endian: low byte first)
         short wasOffset = (short)Math.Clamp(config.WasOffset, -32768, 32767);
@@ -470,10 +494,7 @@ public static class PgnBuilder
         // Ackermann correction (0-200)
         buf[12] = (byte)Math.Clamp(config.Ackermann, 0, 200);
 
-        // CRC
-        buf[13] = CalculateCrc(buf, 2, 11);
-
-        return buf;
+        return WithCrc(buf);
     }
 
     /// <summary>
@@ -514,10 +535,12 @@ public static class PgnBuilder
         // Set0 byte (use helper from config)
         buf[5] = config.GetSetting0Byte();
 
-        // Pulse count (not currently used, set to 0)
-        buf[6] = 0;
+        // Sensor kickout threshold (#105). The firmware (AiO v4 Autosteer.ino: PulseCountMax)
+        // disengages when encoder pulses >= this, or when the pressure / current reading
+        // (0-255) >= this. Hard-coding 0 made every enabled sensor kick out on every loop.
+        buf[6] = SensorTripByte(config);
 
-        // Min steer speed * 10
+        // Min steer speed * 10 (AgOpenGPS sends it; standard firmware ignores this byte)
         buf[7] = (byte)Math.Clamp((int)(config.MinSteerSpeed * 10), 0, 255);
 
         // Set1 byte (use helper from config)
@@ -526,10 +549,22 @@ public static class PgnBuilder
         // Angular velocity (not currently used, set to 0)
         buf[9] = 0;
 
-        // CRC
-        buf[10] = CalculateCrc(buf, 2, 8);
+        return WithCrc(buf);
+    }
 
-        return buf;
+    /// <summary>
+    /// PGN 251 byte 6, as AgOpenGPS FormSteer fills it: with a pressure or current sensor, that
+    /// sensor's trip point (the panel's %, stored raw 0-255 — AgOpenGPS shows raw × 0.392 as %);
+    /// otherwise the turn-sensor encoder count. A 0 % trip point means "off" (as the host-side
+    /// kickout in AutoSteerService treats it, and it's the default) — sent as 255 so the
+    /// firmware's <c>reading &gt;= threshold</c> doesn't trip on every loop.
+    /// </summary>
+    public static byte SensorTripByte(AutoSteerConfig config)
+    {
+        static byte Pct(int pct) => pct <= 0 ? (byte)255 : (byte)Math.Clamp((int)Math.Round(pct * 255.0 / 100.0), 1, 255);
+        if (config.PressureSensorEnabled) return Pct(config.PressureTripPoint);
+        if (config.CurrentSensorEnabled) return Pct(config.CurrentTripPoint);
+        return (byte)Math.Clamp(config.TurnSensorCounts, 0, 255);
     }
 
     #region PGN 253 Parser (Steer Data FROM Module)

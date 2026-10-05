@@ -24,6 +24,7 @@ public sealed class SceneProjector
     private readonly ISmartWasCalibrationService _smartWas;
     private readonly IUdpCommunicationService _udp;
     private readonly INtripProfileService _ntripProfiles;
+    private readonly INtripClientService? _ntrip;
     private readonly IFieldService _fields;
     private readonly ISettingsService _settings;
     private readonly IVehicleProfileService _vehicleProfiles;
@@ -37,6 +38,15 @@ public sealed class SceneProjector
     /// each broadcast tick (same VM-coupled provider pattern as Boundary/RecordedPath).
     /// Read off the broadcaster thread; tolerates transient races like the others.</summary>
     public System.Func<IReadOnlyList<HeadlandSegInfoDto>>? HeadlandSegsProvider { get; set; }
+    // Heading chart (AgOpenGPS FormGraphHeading): GPS fix-to-fix and IMU-corrected
+    // heading, degrees (IMU NaN when there's none). Host-supplied (#111).
+    public System.Func<(double Gps, double Imu)>? HeadingChartProvider { get; set; }
+    // GPS source (#157): the incoming sentence ("PANDA"/"PAOGI"/"SIM", "" before any fix)
+    // and whether Dual GPS is on without a dual-antenna heading. Host-supplied.
+    public System.Func<(string Sentence, bool DualHeadingMissing)>? GpsSourceProvider { get; set; }
+    // System Data card (Network IO → GPS): attitude, heading sources, sentence rate and the
+    // latest raw sentences. Host-supplied; null before any GPS data.
+    public System.Func<SystemDataDto?>? SystemDataProvider { get; set; }
 
     /// <summary>Host-supplied projector for the generated tram lines (ITramLineService's
     /// ParallelTramLines — pipeline state, but the service isn't injected here). Set by the
@@ -49,8 +59,9 @@ public sealed class SceneProjector
         IAutoSteerService autoSteer, ISmartWasCalibrationService smartWas,
         IUdpCommunicationService udp, INtripProfileService ntripProfiles,
         IFieldService fields, ISettingsService settings, IVehicleProfileService vehicleProfiles,
-        IPersistentStateService persist)
+        IPersistentStateService persist, INtripClientService? ntrip = null)
     {
+        _ntrip = ntrip;
         _fields = fields;
         _settings = settings;
         _vehicleProfiles = vehicleProfiles;
@@ -170,6 +181,18 @@ public sealed class SceneProjector
         var tramLines = TramLinesProvider?.Invoke()
             ?? (IReadOnlyList<IReadOnlyList<Vec2Dto>>)System.Array.Empty<IReadOnlyList<Vec2Dto>>();
 
+        // Recorded paths (Tracks manager "Rec paths") and contour strips — visible saved
+        // tracks of those kinds, drawn as their own layer (#110).
+        List<IReadOnlyList<Vec2Dto>> Lines(Models.Track.TrackType type) => f.Tracks.ToArray()
+            .Where(t => t.Type == type && t.IsVisible && t.Points.Count >= 2)
+            .Select(t => (IReadOnlyList<Vec2Dto>)t.Points.Select(p => new Vec2Dto(p.Easting, p.Northing)).ToList())
+            .ToList();
+        var recordedPaths = _state.FieldTools.ShowRecordedPaths
+            ? Lines(Models.Track.TrackType.RecordedPath) : new List<IReadOnlyList<Vec2Dto>>();
+        var contourStrips = Lines(Models.Track.TrackType.Contour);
+        var cref = _state.Operation.IsContourOn ? _state.Operation.ContourRef : null;
+        IReadOnlyList<Vec2Dto>? contourRef = cref?.Select(p => new Vec2Dto(p.Easting, p.Northing)).ToList();
+
         return new SceneDto(
             version,
             f.OriginLatitude,
@@ -189,7 +212,11 @@ public sealed class SceneProjector
             trackList,
             headlandSegs,
             tramSystems,
-            tramLines);
+            tramLines,
+            recordedPaths,
+            contourStrips,
+            contourRef,
+            _state.Operation.IsContourOn && _state.Operation.IsContourLocked);
     }
 
     // Tracks-manager display label — mirrors native TracksDialog (Contour → Path →
@@ -236,6 +263,7 @@ public sealed class SceneProjector
             sections[i] = (byte)secStates[i].ColorCode;
 
         var g = _state.Guidance;
+        var hchart = HeadingChartProvider?.Invoke() ?? (double.NaN, double.NaN);
 
         return new TickDto(
             sceneVersion,
@@ -286,7 +314,7 @@ public sealed class SceneProjector
             _config.Tool.IsHeadlandSectionControl, // single source (read live from config)
             _state.FieldTools.IsAutoTrackEnabled,
             _state.FieldTools.UTurnSkipRows,
-            _state.FieldTools.IsUTurnSkipRowsEnabled,
+            _state.FieldTools.UTurnSkipMode, // 0 normal / 1 alternative / 2 ignore worked (#111)
             (int)_config.Tram.DisplayMode,
             // Headland-distance HUD (-1 = no headland / not driving → hidden client-side).
             _state.Field.HeadlandProximityDistance ?? -1.0,
@@ -297,7 +325,7 @@ public sealed class SceneProjector
             _state.Guidance.SteerAngle,                  // ChartSetSteer (commanded)
             _autoSteer.LastSteerData.ActualSteerAngle,   // ChartActualSteer (WAS)
             _autoSteer.LastSteerData.PwmDisplay,         // ChartPwm
-            _autoSteer.LastSteerData.ImuHeading,         // ChartImuHeading
+            hchart.Imu,                                  // ChartImuHeading (IMU + offset, #111)
             // Hitch pivot (implement hitch line: hitch → tool) — render-pull dead-reckoned.
             v.RenderHitchEasting,
             v.RenderHitchNorthing,
@@ -311,7 +339,18 @@ public sealed class SceneProjector
                 : System.Diagnostics.Stopwatch.GetTimestamp() * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
             // Mid-turn gate (issue #50): true while the u-turn arc is executing.
             _state.YouTurn.IsExecuting,
-            _state.Guidance.HowManyPathsAway); // pass offset (0 = on reference) — #reference/label
+            _state.Guidance.HowManyPathsAway, // pass offset (0 = on reference) — #reference/label
+            // Driver-relative nudge (#93): the pipeline stores it in track frame and flips the
+            // intent's sign when heading against the track, so flip it back the same way.
+            g.IsHeadingSameWay ? g.NudgeOffset : -g.NudgeOffset,
+            // Pure Pursuit goal (#95) — only with an active track (the flag can lag a
+            // track deselect by one cycle).
+            g.HasGoalPoint && _state.Field.ActiveTrack != null,
+            g.GoalPoint.Easting,
+            g.GoalPoint.Northing,
+            g.IsReverse,
+            _state.Connections.IsModuleNotSteering,
+            hchart.Gps);
     }
 
     // Top status-bar readouts (Phase 1). All state-projected: fix/age/sats from
@@ -322,6 +361,7 @@ public sealed class SceneProjector
         var c = _state.Connections;
         var cfg = _config.Connections;
         var sw = _smartWas.GetSnapshot();
+        var gpsSource = GpsSourceProvider?.Invoke() ?? ("", false);
         return new StatusDto(
             v.FixQuality,
             v.FixQualityText,
@@ -367,6 +407,10 @@ public sealed class SceneProjector
             c.IsNtripConnected,
             c.NtripStatus ?? "",
             c.NtripBytesReceived,
+            c.NtripRtcmDestination ?? "",
+            c.NtripRtcmUnicast,
+            cfg.RtcmBroadcast,
+            cfg.NtripEnabled,
             c.NtripTestStatus ?? "",
             _persist.State.SimulatorPanelVisible,
             // Field Tools — Offset Fix drift offset (meters).
@@ -376,7 +420,23 @@ public sealed class SceneProjector
             // Dev diagnostics row: overlay gate (marker) + host control-loop latency (same
             // VehicleStateSnapshot.TotalLatencyMs the VM's GpsToPgnLatencyMs mirrors).
             _devOverlay,
-            _autoSteer.LatestSnapshot?.TotalLatencyMs ?? 0.0);
+            _autoSteer.LatestSnapshot?.TotalLatencyMs ?? 0.0,
+            gpsSource.Sentence ?? "",
+            gpsSource.DualHeadingMissing,
+            BuildNtripRtcm(),
+            SystemDataProvider?.Invoke());
+    }
+
+    // Read live for every status frame, so "seconds since the last one" keeps counting
+    // while the caster is silent: that is when the panel's warnings matter.
+    private NtripRtcmDto? BuildNtripRtcm()
+    {
+        if (_ntrip is not { IsActive: true }) return null;
+        var snap = _ntrip.GetRtcmStreamSnapshot();
+        if (snap == null) return null;
+        return new NtripRtcmDto(snap.SessionSeconds, snap.Messages, snap.ChecksumFailures, snap.BytesSkipped,
+            snap.SupersededObservations + snap.SupersededOther + snap.MemoryGuardDrops, snap.Unframed,
+            snap.Types.Select(t => new NtripRtcmTypeDto(t.Type, t.Count, t.MeanIntervalSeconds, t.SecondsSinceLast)).ToList());
     }
 
     // NTRIP profiles read-frame (Network IO). Projects INtripProfileService's saved
@@ -453,7 +513,7 @@ public sealed class SceneProjector
         return new FieldOpsDto(fields, jobs, suggestions, iso, kml, _fields.ActiveField?.Name ?? "");
     }
 
-    // ISO-XML (subdirs with TASKDATA.xml) + KML/KMZ files under ~/Documents/AgOpenWeb/Import.
+    // ISO-XML (subdirs with TASKDATA.xml) + KML/KMZ files under <data root>/Import.
     // Mirrors MainViewModel.PopulateAvailableIsoXmlFiles / PopulateAvailableKmlFiles.
     private static (System.Collections.Generic.List<string> iso, System.Collections.Generic.List<string> kml) ScanImportFolder()
     {
@@ -461,12 +521,17 @@ public sealed class SceneProjector
         var kml = new System.Collections.Generic.List<string>();
         try
         {
-            var docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments);
-            if (string.IsNullOrEmpty(docs)) docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.Personal);
-            var importDir = System.IO.Path.Combine(docs, "AgOpenWeb", "Import");
+            // Resolve the Import folder from the shared AgOpenWeb data root (honors
+            // AGOPENWEB_DATA), same as Fields/Tools/Vehicles/NtripProfiles. Using
+            // MyDocuments directly diverged from the data root on headless installs,
+            // so the scanned folder never matched where files actually live.
+            var importDir = System.IO.Path.Combine(AppDataRoot.Documents, "Import");
             if (!System.IO.Directory.Exists(importDir)) return (iso, kml);
             foreach (var dir in System.IO.Directory.GetDirectories(importDir))
-                if (System.IO.File.Exists(System.IO.Path.Combine(dir, "TASKDATA.xml")))
+                // Case-insensitive: ISOBUS writes TASKDATA.XML, which File.Exists misses on
+                // Linux (a case-sensitive file system) — the importer already matches it (#111).
+                if (System.IO.Directory.EnumerateFiles(dir).Any(f => string.Equals(
+                        System.IO.Path.GetFileName(f), "TASKDATA.XML", System.StringComparison.OrdinalIgnoreCase)))
                     iso.Add(new System.IO.DirectoryInfo(dir).Name);
             foreach (var fp in System.IO.Directory.GetFiles(importDir, "*.kml", System.IO.SearchOption.AllDirectories)
                 .Concat(System.IO.Directory.GetFiles(importDir, "*.kmz", System.IO.SearchOption.AllDirectories)))
@@ -506,7 +571,7 @@ public sealed class SceneProjector
             foreach (var name in _fields.GetAvailableFields(root))
             {
                 if (name == active) continue;
-                if (AgOpenWeb.Services.TrackFilesService.Exists(System.IO.Path.Combine(root, name)))
+                if (_fields.PeekTracks(System.IO.Path.Combine(root, name)).Count > 0)
                     importFields.Add(name);
             }
         return new FieldToolsDto(importFields);
@@ -521,8 +586,12 @@ public sealed class SceneProjector
             foreach (var name in _fields.GetAvailableFields(root))
             {
                 if (name == active) continue;
-                if (AgOpenWeb.Services.TrackFilesService.Exists(System.IO.Path.Combine(root, name)))
-                    h = h * 31 + name.GetHashCode();
+                // Cheap (runs every broadcast tick): file times, not contents. BuildFieldTools
+                // reads the tracks when this changes.
+                var dir = System.IO.Path.Combine(root, name);
+                h = h * 31 + name.GetHashCode();
+                h = h * 31 + System.IO.File.GetLastWriteTimeUtc(System.IO.Path.Combine(dir, "field.geojson")).Ticks;
+                h = h * 31 + System.IO.File.GetLastWriteTimeUtc(System.IO.Path.Combine(dir, AgOpenWeb.Services.TrackFilesService.FileName)).Ticks;
             }
         h = h * 31 + (active?.GetHashCode() ?? 0);
         return h;
@@ -530,7 +599,7 @@ public sealed class SceneProjector
 
     // AgShare read-frame. Settings from ConfigStore.Connections; live action status +
     // fetched cloud fields from ApplicationState.AgShare; upload candidates = every field
-    // on disk (with whether it has a Boundary.txt). Mirrors the native dialogs' scans.
+    // on disk (with whether it has an outer boundary), read without importing.
     public AgShareDto BuildAgShare()
     {
         var c = _config.Connections;
@@ -541,9 +610,14 @@ public sealed class SceneProjector
         {
             if (!string.IsNullOrEmpty(root) && System.IO.Directory.Exists(root))
                 foreach (var dir in System.IO.Directory.GetDirectories(root))
-                    if (System.IO.File.Exists(System.IO.Path.Combine(dir, "Field.txt")))
-                        local.Add(new AgShareLocalFieldDto(System.IO.Path.GetFileName(dir),
-                            System.IO.File.Exists(System.IO.Path.Combine(dir, "Boundary.txt"))));
+                {
+                    // field.geojson, or an AgOpenGPS field not yet imported
+                    Field field;
+                    try { field = _fields.PeekField(dir); }
+                    catch { continue; }
+                    local.Add(new AgShareLocalFieldDto(System.IO.Path.GetFileName(dir),
+                        field.Boundary?.OuterBoundary is { IsValid: true }));
+                }
         }
         catch { /* fields dir optional */ }
         local.Sort((a, b) => string.Compare(a.Name, b.Name, System.StringComparison.OrdinalIgnoreCase));
@@ -554,11 +628,21 @@ public sealed class SceneProjector
 
     // File / Application Menu read-frame. Version+git (assembly), languages, app directories,
     // hotkey bindings, recent in-memory logs, bug-report status.
-    private static readonly string[] _langCodes =
+    private static readonly string[] _langCodes = FindLanguages();
+
+    // English plus every wwwroot/i18n/<code>.json in the assembly (#143): a language
+    // appears in the picker once its translation file exists.
+    private static string[] FindLanguages()
     {
-        "en", "da", "de", "es", "et", "fi", "fr", "hu", "it", "ko",
-        "lt", "lv", "nl", "no", "pl", "pt", "ru", "sk", "sr", "tr", "uk", "zh-Hans"
-    };
+        const string marker = ".wwwroot.i18n.";
+        var codes = typeof(SceneProjector).Assembly.GetManifestResourceNames()
+            .Select(n => (Name: n, At: n.IndexOf(marker, System.StringComparison.OrdinalIgnoreCase)))
+            .Where(x => x.At >= 0 && x.Name.EndsWith(".json", System.StringComparison.OrdinalIgnoreCase))
+            .Select(x => x.Name[(x.At + marker.Length)..^".json".Length])
+            .Where(c => !string.Equals(c, "en", System.StringComparison.OrdinalIgnoreCase))
+            .OrderBy(c => c, System.StringComparer.OrdinalIgnoreCase);
+        return new[] { "en" }.Concat(codes).ToArray();
+    }
 
     public AppInfoDto BuildAppInfo()
     {
@@ -686,27 +770,31 @@ public sealed class SceneProjector
                 t.CoverageMargin, t.IsWorkSwitchEnabled, t.IsWorkSwitchActiveLow, t.IsWorkSwitchManualSections,
                 t.IsSteerSwitchEnabled, t.IsSteerSwitchManualSections, _config.ActualToolWidth),
             new UturnConfigDto(g.UTurnStyle, g.UTurnExtension, g.UTurnSmoothing, g.UTurnRadius, g.UTurnDistanceFromBoundary),
-            new TramConfigDto(g.TramPasses, g.TramDisplay, g.TramLine),
+            // Line = the field's actual start pass (tram settings live with the field), 1-based.
+            new TramConfigDto(g.TramPasses, g.TramDisplay, _config.Tram.StartPass + 1, _config.Tram.TramWidth),
             new MachineConfigDto(m.HydraulicLiftEnabled, m.RaiseTime, m.LookAhead, m.LowerTime, m.InvertRelay,
                 m.User1Value, m.User2Value, m.User3Value, m.User4Value, pins),
             BuildDisplay(), BuildAutoSteer());
     }
 
-    // AutoSteer config tab — projects the full 9-tab ConfigStore.AutoSteer surface.
+    // AutoSteer config tab — projects the full 9-tab AutoSteer panel. The algorithm /
+    // look-ahead / integral / Stanley / U-turn values come from GuidanceConfig, which is
+    // what the pipeline steers with (#99); the rest is ConfigStore.AutoSteer.
     private AutoSteerConfigDto BuildAutoSteer()
     {
         var a = _config.AutoSteer;
+        var g = _config.Guidance;
         return new AutoSteerConfigDto(
-            a.SteerResponseHold, a.IntegralGain, a.IsStanleyMode,
-            a.StanleyAggressiveness, a.StanleyOvershootReduction,
-            a.WasOffset, a.CountsPerDegree, a.Ackermann, a.MaxSteerAngle,
-            a.DeadzoneHeading, a.DeadzoneDelay, a.SpeedFactor, a.AcquireFactor,
+            g.GoalPointLookAheadHold, g.PurePursuitIntegralGain, g.IsStanley,
+            g.StanleyDistanceErrorGain, g.StanleyHeadingErrorGain,
+            a.WasOffset, a.CountsPerDegree, a.Ackermann, (int)System.Math.Round(_config.Vehicle.MaxSteerAngle),
+            a.DeadzoneHeading, a.DeadzoneDelay, g.GoalPointLookAheadMult, g.GoalPointAcquireFactor,
             a.ProportionalGain, a.MaxPwm, a.MinPwm,
             a.TurnSensorEnabled, a.PressureSensorEnabled, a.CurrentSensorEnabled,
             a.TurnSensorCounts, a.PressureTripPoint, a.CurrentTripPoint,
             a.DanfossEnabled, a.InvertWas, a.InvertMotor, a.InvertRelays,
             a.MotorDriver, a.AdConverter, a.ImuAxisSwap, a.ExternalEnable,
-            a.UTurnCompensation, a.SideHillCompensation, a.SteerInReverse,
+            GuidanceConfig.UTurnCompensationToPercent(g.UTurnCompensation), a.SideHillCompensation, a.SteerInReverse,
             a.ManualTurnsEnabled, a.ManualTurnsSpeed, a.MinSteerSpeed, a.MaxSteerSpeed,
             a.LineWidth, a.NudgeDistance, a.NextGuidanceTime, a.CmPerPixel,
             a.LightbarEnabled, a.SteerBarEnabled, a.GuidanceBarOn);
@@ -751,6 +839,9 @@ public sealed class SceneProjector
         foreach (var n in _configService.GetAvailableToolProfiles()) h = h * 31 + n.GetHashCode();
         h = h * 31 + _config.ActiveVehicleProfileName.GetHashCode();
         h = h * 31 + _config.ActiveToolProfileName.GetHashCode();
+        // The previews are host-rendered strings carrying units, so a metric/imperial
+        // flip changes this frame's content — fold it in or the picker stays stale.
+        h = h * 31 + (_config.IsMetric ? 1 : 2);
         return h * 31 + ConfigFingerprint();
     }
 
@@ -787,6 +878,7 @@ public sealed class SceneProjector
         for (int i = 0; i < 9; i++) h = h * 31 + t.GetZoneEndSection(i);
         h = h * 31 + (int)t.SingleCoverageColor;
         h = h * 31 + g.UTurnStyle * 7 + g.UTurnSmoothing * 11 + g.TramPasses * 13 + (g.TramDisplay ? 1 : 0) + g.TramLine * 17;
+        h = h * 31 + _config.Tram.StartPass * 19 + _config.Tram.TramWidth.GetHashCode(); // #110
         h = h * 31 + (mc.HydraulicLiftEnabled ? 1 : 0) + mc.RaiseTime * 7 + mc.LowerTime * 11 + (mc.InvertRelay ? 64 : 0)
               + mc.User1Value + mc.User2Value * 3 + mc.User3Value * 5 + mc.User4Value * 7;
         for (int i = 0; i < 24; i++) h = h * 31 + (int)mc.GetPinAssignment(i);
@@ -805,19 +897,20 @@ public sealed class SceneProjector
         h = h * 31 + (_persist.State.IsDayMode ? 1 : 0);
         // AutoSteer config (so AutoSteer-panel edits re-send the frame).
         var asc = _config.AutoSteer;
-        int ab = (asc.IsStanleyMode ? 1 : 0) | (asc.TurnSensorEnabled ? 2 : 0) | (asc.PressureSensorEnabled ? 4 : 0)
+        var gdc = _config.Guidance;
+        int ab = (gdc.IsStanley ? 1 : 0) | (asc.TurnSensorEnabled ? 2 : 0) | (asc.PressureSensorEnabled ? 4 : 0)
             | (asc.CurrentSensorEnabled ? 8 : 0) | (asc.DanfossEnabled ? 16 : 0) | (asc.InvertWas ? 32 : 0)
             | (asc.InvertMotor ? 64 : 0) | (asc.InvertRelays ? 128 : 0) | (asc.SteerInReverse ? 256 : 0)
             | (asc.ManualTurnsEnabled ? 512 : 0) | (asc.LightbarEnabled ? 1024 : 0) | (asc.SteerBarEnabled ? 2048 : 0)
             | (asc.GuidanceBarOn ? 4096 : 0);
         h = h * 31 + ab;
-        h = h * 31 + asc.WasOffset * 3 + asc.Ackermann * 5 + asc.MaxSteerAngle * 7 + asc.DeadzoneDelay * 11
+        h = h * 31 + asc.WasOffset * 3 + asc.Ackermann * 5 + (int)System.Math.Round(_config.Vehicle.MaxSteerAngle) * 7 + asc.DeadzoneDelay * 11
               + asc.ProportionalGain * 13 + asc.MaxPwm * 17 + asc.MinPwm * 19 + asc.TurnSensorCounts * 23
               + asc.PressureTripPoint * 29 + asc.CurrentTripPoint * 31 + asc.MotorDriver * 37 + asc.AdConverter * 41
               + asc.ImuAxisSwap * 43 + asc.ExternalEnable * 47 + asc.LineWidth * 53 + asc.NudgeDistance * 59 + asc.CmPerPixel * 61;
-        foreach (var d in new[] { asc.SteerResponseHold, asc.IntegralGain, asc.StanleyAggressiveness,
-                                  asc.StanleyOvershootReduction, asc.CountsPerDegree, asc.DeadzoneHeading,
-                                  asc.SpeedFactor, asc.AcquireFactor, asc.UTurnCompensation, asc.SideHillCompensation,
+        foreach (var d in new[] { gdc.GoalPointLookAheadHold, gdc.PurePursuitIntegralGain, gdc.StanleyDistanceErrorGain,
+                                  gdc.StanleyHeadingErrorGain, asc.CountsPerDegree, asc.DeadzoneHeading,
+                                  gdc.GoalPointLookAheadMult, gdc.GoalPointAcquireFactor, gdc.UTurnCompensation, asc.SideHillCompensation,
                                   asc.ManualTurnsSpeed, asc.MinSteerSpeed, asc.MaxSteerSpeed, asc.NextGuidanceTime })
             h = h * 31 + d.GetHashCode();
         return h;
@@ -837,6 +930,10 @@ public sealed class SceneProjector
         if (bnd?.InnerBoundaries != null)
             foreach (var inner in bnd.InnerBoundaries.ToArray()) h = h * 31 + inner.Points.Count;
         h = h * 31 + (f.HeadlandLine?.Count ?? 0);
+        h = h * 31 + (_state.FieldTools.ShowRecordedPaths ? 1 : 0); // #110
+        // Contour reference strip (a new list per change) + lock.
+        h = h * 31 + (_state.Operation.IsContourOn && _state.Operation.ContourRef is { } cr ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(cr) : 0);
+        h = h * 31 + (_state.Operation.IsContourOn && _state.Operation.IsContourLocked ? 1 : 0);
         h = h * 31 + f.Tracks.Count;
         // Point count + name + active/visible so the Tracks manager refreshes on
         // activate/hide/rename (none of which change point counts).
@@ -880,6 +977,7 @@ public sealed class SceneProjector
             h = h * 31 + (s.ReferenceTrackName?.GetHashCode() ?? s.ReferenceBoundaryIndex);
         }
         h = h * 31 + (TramLinesProvider?.Invoke()?.Count ?? 0);
+        h = h * 31 + (int)_config.Tram.DisplayMode; // mode filters the tram lines (#111)
 
         // Flags: re-send the Scene on place/delete. Count + last position (rounded to
         // 0.1 m) catches add/remove/move without per-tick churn.

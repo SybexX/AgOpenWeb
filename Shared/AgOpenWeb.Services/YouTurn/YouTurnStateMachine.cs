@@ -68,6 +68,8 @@ public sealed class YouTurnStateMachine
     private const double CompletionMinTraveledMeters = 5.0;
 
     private readonly YouTurnCreationService _creation;
+    // U-turn sound latches (AgOpenGPS turnTooCloseTrigger / isBoundAlarming) (#110).
+    private bool _creationFailSounded, _approachAlarmed;
     private readonly YouTurnPathingService _pathing;
     private readonly ILogger<YouTurnStateMachine> _logger;
     private readonly ConfigurationStore _configStore;
@@ -96,7 +98,8 @@ public sealed class YouTurnStateMachine
         int UTurnSkipRows,
         bool IsSkipWorkedMode,
         double HeadlandCalculatedWidth,
-        double HeadlandDistance);
+        double HeadlandDistance,
+        bool IsAlternateSkipMode = false); // AgOpenGPS SkipMode.Alternative (#111)
 
     /// <summary>
     /// Run one cycle of the state machine. Precondition: autosteer engaged, track active,
@@ -119,18 +122,7 @@ public sealed class YouTurnStateMachine
         double abHeading;
         if (isCurve)
         {
-            double minDistSq = double.MaxValue;
-            int nearestIdx = 0;
-            for (int i = 0; i < track.Points.Count; i++)
-            {
-                double dx = track.Points[i].Easting - currentPosition.Easting;
-                double dy = track.Points[i].Northing - currentPosition.Northing;
-                double distSq = dx * dx + dy * dy;
-                if (distSq < minDistSq) { minDistSq = distSq; nearestIdx = i; }
-            }
-            abHeading = track.Points[nearestIdx].Heading;
-            _logger.LogDebug("[YouTurn] Curve mode: nearest index={Idx}, localHeading={Deg:F1}°",
-                nearestIdx, abHeading * 180 / Math.PI);
+            abHeading = LocalCurveHeading(track, currentPosition);
         }
         else
         {
@@ -208,17 +200,19 @@ public sealed class YouTurnStateMachine
         {
             _logger.LogDebug("[YouTurn] Direction override set with rendered path — re-arming with {Dir}",
                 turn.NextUTurnDirectionLeftOverride.Value ? "LEFT" : "RIGHT");
-            turn.TurnPath = null;
-            turn.NextTrack = null;
-            turn.IsTriggered = false;
+            DiscardPlannedTurn(turn);
             effects.SyncTurnPathToMap = true;
             effects.SyncNextTrackToMap = true;
         }
+
+        if (!ctx.IsAlternateSkipMode) turn.AltSign = 0; // pattern restarts when re-entered
 
         if (turn.TurnPath == null && !turn.IsExecuting && canCreateTurn && isAlignedWithABLine)
         {
             if (ctx.IsSkipWorkedMode)
                 HandleSnakeCreation(in ctx, track, abHeading, currentPosition, headingRadians, guidance, turn, effects);
+            else if (ctx.IsAlternateSkipMode)
+                HandleAlternateCreation(in ctx, track, abHeading, headingRadians, guidance, turn, effects);
             else
                 HandleNormalCreation(in ctx, track, abHeading, currentPosition, headingRadians, guidance, turn, effects);
         }
@@ -240,6 +234,15 @@ public sealed class YouTurnStateMachine
                 ? ArcLengthAlongTrack(track.Points, currentPosition, turnStart)
                 : distToTurnStart;
 
+            // Alarm once as the tractor comes within 20 m of the turn. AgOpenGPS tests a
+            // 18–20 m band, which a fast approach steps straight over between fixes — the
+            // alarm then sounded on roughly every other turn (#150).
+            if (distToTurnStart <= 20.0 && !_approachAlarmed)
+            {
+                _approachAlarmed = true;
+                effects.ApproachAlarmSound = true;
+            }
+
             // Trigger on physical proximity (straight-line): the tractor must actually reach the
             // turn start, regardless of how the arc-length display reads.
             if (distToTurnStart <= TriggerProximityMeters)
@@ -254,8 +257,7 @@ public sealed class YouTurnStateMachine
         else if (turn.TurnPath != null && !turn.IsTriggered && isInHeadlandZone)
         {
             _logger.LogDebug("[YouTurn] Entered headland without triggering - resetting turn");
-            turn.TurnPath = null;
-            turn.NextTrack = null;
+            DiscardPlannedTurn(turn);
             effects.SyncTurnPathToMap = true;
             effects.SyncNextTrackToMap = true;
         }
@@ -269,6 +271,44 @@ public sealed class YouTurnStateMachine
         //   (2) Legacy closest-approach as a backstop for the case
         //       where (1) misses (e.g., a very short path where the
         //       arc-length never exceeds the lookahead).
+        CheckCompletion(in ctx, guidance, turn, effects);
+
+        return effects;
+    }
+
+    /// <summary>
+    /// Run only the turn-completion checks for a turn that is already executing. The
+    /// caller uses this when the full <see cref="Tick"/> is gated off (no headland line)
+    /// but a manual turn is in progress — without it a manual turn in a field with no
+    /// headland never completes (#163).
+    /// </summary>
+    public YouTurnEffects TickExecutingTurn(in TickContext ctx, GuidanceWorkingState guidance, YouTurnWorkingState turn)
+    {
+        var effects = new YouTurnEffects();
+        if (ctx.SelectedTrack == null || ctx.SelectedTrack.Points.Count < 2) return effects;
+        CheckCompletion(in ctx, guidance, turn, effects);
+        return effects;
+    }
+
+    /// <summary>
+    /// Complete the executing turn because U-turn guidance reached the end of the path
+    /// (AgOpenGPS CYouTurn calls CompleteYouTurn from its guidance the same way). Backstop
+    /// for the arc-length / closest-approach checks: guidance stops steering once it
+    /// reports the path finished, so an uncompleted turn would leave the tractor with no
+    /// steering at all. No-op when no turn is executing.
+    /// </summary>
+    public YouTurnEffects CompleteFromGuidance(in TickContext ctx, GuidanceWorkingState guidance, YouTurnWorkingState turn)
+    {
+        var effects = new YouTurnEffects();
+        if (!turn.IsExecuting) return effects;
+        _logger.LogDebug("[YouTurn] Guidance reached end of turn path — completing turn");
+        CompleteTurn(in ctx, guidance, turn, effects);
+        return effects;
+    }
+
+    private void CheckCompletion(in TickContext ctx, GuidanceWorkingState guidance, YouTurnWorkingState turn, YouTurnEffects effects)
+    {
+        var currentPosition = ctx.CurrentPosition;
         if (turn.IsExecuting && turn.TurnPath != null && turn.TurnPath.Count > 2)
         {
             var startPoint = turn.TurnPath[0];
@@ -327,7 +367,7 @@ public sealed class YouTurnStateMachine
                     remainingArc, EarlyCompletionLookahead, traveledArc,
                     distToTurnStart, distToTurnEnd);
                 CompleteTurn(in ctx, guidance, turn, effects);
-                return effects;
+                return;
             }
 
             // Closest-approach backstop: complete when the tractor was
@@ -338,8 +378,13 @@ public sealed class YouTurnStateMachine
             bool wasClose = turn.PreviousDistToTurnEnd < ClosestApproachThreshold;
             bool movingAway = distToTurnEnd > turn.PreviousDistToTurnEnd;
             bool traveledEnough = distToTurnStart > CompletionMinTraveledMeters;
+            // "Close to the end" must also hold along the path. A manual turn onto a pass
+            // less than 5 m away ends beside its own first metres: the tractor drives past
+            // the end point, a pass width away, on its way into the turn, and that read as
+            // reaching the end and leaving it, with the whole loop still to drive (#272).
+            bool onFinalStretch = remainingArc < ClosestApproachThreshold;
 
-            if (wasClose && movingAway && traveledEnough
+            if (wasClose && movingAway && traveledEnough && onFinalStretch
                 && distToTurnEnd < distToTurnStart)
             {
                 _logger.LogDebug("[YouTurn] Closest-approach completion: distEnd={DistEnd:F1}m prevDist={Prev:F1}m distStart={DistStart:F1}m",
@@ -349,8 +394,6 @@ public sealed class YouTurnStateMachine
 
             turn.PreviousDistToTurnEnd = distToTurnEnd;
         }
-
-        return effects;
     }
 
     /// <summary>
@@ -441,6 +484,21 @@ public sealed class YouTurnStateMachine
         return total;
     }
 
+    /// <summary>Heading of a curve track at its point nearest <paramref name="position"/>, radians.</summary>
+    private static double LocalCurveHeading(Models.Track.Track track, Position position)
+    {
+        double minDistSq = double.MaxValue;
+        int nearestIdx = 0;
+        for (int i = 0; i < track.Points.Count; i++)
+        {
+            double dx = track.Points[i].Easting - position.Easting;
+            double dy = track.Points[i].Northing - position.Northing;
+            double distSq = dx * dx + dy * dy;
+            if (distSq < minDistSq) { minDistSq = distSq; nearestIdx = i; }
+        }
+        return track.Points[nearestIdx].Heading;
+    }
+
     /// <summary>
     /// Manually trigger a U-turn in the specified direction. Used for tracks along boundaries
     /// where automatic headland detection doesn't fire.
@@ -469,13 +527,10 @@ public sealed class YouTurnStateMachine
         }
 
         // If an auto-trigger plotted a path but it hasn't engaged yet, discard it so
-        // the manual trigger's immediate arc takes over.
-        if (turn.TurnPath != null)
-        {
-            turn.TurnPath = null;
-            turn.IsTriggered = false;
-            effects.SyncTurnPathToMap = true;
-        }
+        // the manual trigger's immediate arc takes over. Also drops a snake / alternate
+        // target pass, so the manual turn completes by its own direction.
+        if (turn.TurnPath != null) effects.SyncTurnPathToMap = true;
+        DiscardPlannedTurn(turn);
 
         var track = ctx.SelectedTrack;
         if (track.Points.Count < 2)
@@ -487,12 +542,21 @@ public sealed class YouTurnStateMachine
         var currentPosition = ctx.CurrentPosition;
         double headingRadians = currentPosition.Heading * Math.PI / 180.0;
 
-        // For manual turns, always use the straight-line AB heading even for curves (matches legacy behavior).
-        var trackPointA = track.Points[0];
-        var trackPointB = track.Points[track.Points.Count - 1];
-        double abDx = trackPointB.Easting - trackPointA.Easting;
-        double abDy = trackPointB.Northing - trackPointA.Northing;
-        double abHeading = Math.Atan2(abDx, abDy);
+        // The line's heading where the tractor is: the curve's local heading (AgOpenGPS
+        // curve.manualUturnHeading), or A→B for an AB line. A curve's first-to-last-point
+        // heading can be far off its local one, which turned the arc away from the tractor
+        // and ended it short of the next pass.
+        double abHeading;
+        if (track.Points.Count > 2)
+        {
+            abHeading = LocalCurveHeading(track, currentPosition);
+        }
+        else
+        {
+            var trackPointA = track.Points[0];
+            var trackPointB = track.Points[1];
+            abHeading = Math.Atan2(trackPointB.Easting - trackPointA.Easting, trackPointB.Northing - trackPointA.Northing);
+        }
 
         double headingDiff = headingRadians - abHeading;
         while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
@@ -515,7 +579,7 @@ public sealed class YouTurnStateMachine
         // the path renders — no headland traversal, no entry/exit legs (#260).
         var path = _creation.CreateManualArcPath(
             ctx.CurrentPosition, abHeading, turnLeft,
-            ctx.Boundary, guidance, ctx.UTurnSkipRows);
+            ctx.Boundary, guidance, ctx.UTurnSkipRows, turn.NextTrack);
 
         if (path.Count > 2)
         {
@@ -540,12 +604,23 @@ public sealed class YouTurnStateMachine
     /// </summary>
     public static void ClearState(YouTurnWorkingState turn)
     {
-        turn.TurnPath = null;
-        turn.NextTrack = null;
-        turn.IsTriggered = false;
+        DiscardPlannedTurn(turn);
         turn.IsExecuting = false;
         turn.YouTurnCounter = 0;
         turn.CurrentZone = TractorZone.OutsideBoundary;
+    }
+
+    /// <summary>
+    /// Drop a planned turn that isn't being driven yet: the path, the next track and the
+    /// snake / alternate target pass (#1203). The next tick plans a fresh one. Without the
+    /// target reset, a later Normal or manual turn would complete onto the stale pass.
+    /// </summary>
+    public static void DiscardPlannedTurn(YouTurnWorkingState turn)
+    {
+        turn.TurnPath = null;
+        turn.NextTrack = null;
+        turn.IsTriggered = false;
+        turn.ReturnPassTargetPath = null;
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
@@ -574,13 +649,30 @@ public sealed class YouTurnStateMachine
             return;
         }
 
+        CreateTurnToPath(in ctx, track, abHeading, headingRadians, guidance, turn, effects, nextPath.Value, "Snake");
+    }
+
+    /// <summary>
+    /// Turn onto a planned pass (snake sequence or alternative skip): the target path sets
+    /// the turn side and width, and CompleteTurn jumps straight to it.
+    /// </summary>
+    private void CreateTurnToPath(
+        in TickContext ctx,
+        Models.Track.Track track,
+        double abHeading,
+        double headingRadians,
+        GuidanceWorkingState guidance,
+        YouTurnWorkingState turn,
+        YouTurnEffects effects,
+        int nextPath,
+        string mode)
+    {
         var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double nextDistAway = widthMinusOverlap * nextPath.Value;
-        int pathDiff = nextPath.Value - guidance.HowManyPathsAway;
+        double nextDistAway = widthMinusOverlap * nextPath;
+        int pathDiff = nextPath - guidance.HowManyPathsAway;
 
-        // Snake mode directly sets the turn geometry without going through the regular
-        // skip logic — the sequence dictates pathDiff.
+        // The planned path dictates pathDiff (snake / alternative), not the regular skip logic.
         bool positiveOffset = pathDiff > 0;
         turn.IsTurnLeft = positiveOffset ^ guidance.IsHeadingSameWay;
         // Apply the UI's one-shot direction override before the snake geometry is
@@ -602,7 +694,7 @@ public sealed class YouTurnStateMachine
             double offsetE = Math.Sin(perpAngle) * nextDistAway;
             double offsetN = Math.Cos(perpAngle) * nextDistAway;
             turn.NextTrack = Models.Track.Track.FromABLine(
-                $"Path {nextPath.Value}",
+                $"Path {nextPath}",
                 new Vec3(refA.Easting + offsetE, refA.Northing + offsetN, abHeading),
                 new Vec3(refB.Easting + offsetE, refB.Northing + offsetN, abHeading));
         }
@@ -613,20 +705,68 @@ public sealed class YouTurnStateMachine
             // Mirrors YouTurnPathingService.ComputeNextTrack; no-op on closed loops.
             var offsetPoints = CurveProcessing.ExtendCurveEnds(
                 CurveProcessing.CreateOffsetCurve(track.Points, nextDistAway));
-            turn.NextTrack = Models.Track.Track.FromCurve($"Path {nextPath.Value}", offsetPoints, track.IsClosed);
+            turn.NextTrack = Models.Track.Track.FromCurve($"Path {nextPath}", offsetPoints, track.IsClosed);
         }
         turn.NextTrack.IsActive = false;
 
         // CompleteTurn will jump directly to this path number instead of computing a skip.
-        turn.ReturnPassTargetPath = nextPath.Value;
+        turn.ReturnPassTargetPath = nextPath;
 
-        _logger.LogDebug("[YouTurn] Snake: path {Cur} -> {Next} (diff={Diff}, offset={Off:F1}m, turnLeft={Left})",
-            guidance.HowManyPathsAway, nextPath.Value, pathDiff, nextDistAway, turn.IsTurnLeft);
+        _logger.LogDebug("[YouTurn] {Mode}: path {Cur} -> {Next} (diff={Diff}, offset={Off:F1}m, turnLeft={Left})",
+            mode, guidance.HowManyPathsAway, nextPath, pathDiff, nextDistAway, turn.IsTurnLeft);
 
         effects.SyncNextTrackToMap = true;
         effects.IsInYouTurnMapFlag = true;
 
         CreatePathAndSync(in ctx, track, headingRadians, abHeading, guidance, turn, effects);
+    }
+
+    /// <summary>
+    /// Alternative skip (AgOpenGPS SkipMode.Alternative, CYouTurn.YouTurnTrigger): plan the
+    /// next pass from the pattern; it advances when the turn completes (#111).
+    /// </summary>
+    private void HandleAlternateCreation(
+        in TickContext ctx,
+        Models.Track.Track track,
+        double abHeading,
+        double headingRadians,
+        GuidanceWorkingState guidance,
+        YouTurnWorkingState turn,
+        YouTurnEffects effects)
+    {
+        int baseWidth = Math.Max(2, ctx.UTurnSkipRows + 1); // AgOpenGPS "at least 1" row skipped
+        if (turn.AltSign == 0 || turn.AltBaseWidth != baseWidth)
+        {
+            var (_, positive) = _pathing.WouldNextLineBeInsideBoundary(
+                track, abHeading, guidance, ctx.Boundary, ctx.HeadlandLine, baseWidth - 1);
+            turn.AltSign = positive ? 1 : -1;
+            turn.AltBaseWidth = turn.AltWidth = baseWidth;
+            turn.AltTurnSkips = baseWidth * 2 - 1;
+            turn.AltPrevBig = false;
+        }
+
+        int nextPath = guidance.HowManyPathsAway + turn.AltSign * turn.AltWidth;
+        if (!_pathing.IsPathInsideCultivated(track, abHeading, nextPath, ctx.Boundary, ctx.HeadlandLine))
+        {
+            effects.StatusMessage = "End of field reached";
+            return;
+        }
+        CreateTurnToPath(in ctx, track, abHeading, headingRadians, guidance, turn, effects, nextPath, "Alternative");
+    }
+
+    // After an alternative-skip turn: flip side and alternate the width, except every
+    // (2W-1)th turn, which keeps the side (AgOpenGPS YouTurnTrigger).
+    internal static void AdvanceAlternate(YouTurnWorkingState turn)
+    {
+        if (turn.AltSign == 0) return;
+        if (--turn.AltTurnSkips == 0)
+        {
+            turn.AltTurnSkips = turn.AltBaseWidth * 2 - 1;
+            return;
+        }
+        turn.AltSign = -turn.AltSign;
+        turn.AltPrevBig = !turn.AltPrevBig;
+        turn.AltWidth = turn.AltPrevBig ? turn.AltBaseWidth - 1 : turn.AltBaseWidth;
     }
 
     private void HandleNormalCreation(
@@ -693,7 +833,13 @@ public sealed class YouTurnStateMachine
         if (result.ClearanceBlocked && effects.StatusMessage == null)
             effects.StatusMessage = "U-turn blocked: implement would swing into a hard boundary — take over manually.";
 
-        if (result.Path == null) return;
+        if (result.Path == null)
+        {
+            if (!_creationFailSounded) { _creationFailSounded = true; effects.TurnCreationFailedSound = true; }
+            return;
+        }
+        _creationFailSounded = false;
+        _approachAlarmed = false;
 
         turn.TurnPath = result.Path;
         turn.YouTurnCounter = 0;
@@ -724,7 +870,8 @@ public sealed class YouTurnStateMachine
                 turn.ReturnPassTargetPath.Value, guidance.HowManyPathsAway);
             guidance.HowManyPathsAway = turn.ReturnPassTargetPath.Value;
             turn.ReturnPassTargetPath = null;
-            _pathing.AdvanceSnakeSequence(turn);
+            if (ctx.IsAlternateSkipMode) AdvanceAlternate(turn);
+            else _pathing.AdvanceSnakeSequence(turn);
         }
         else
         {
@@ -868,4 +1015,11 @@ public sealed class YouTurnEffects
     /// the newly-offset track from the start.
     /// </summary>
     public bool TurnCompleted { get; set; }
+
+    /// <summary>U-turn sound (AgOpenGPS isTurnSoundOn, #110): the turn couldn't be created
+    /// (sndUTurnTooClose), once per failure run.</summary>
+    public bool TurnCreationFailedSound { get; set; }
+
+    /// <summary>U-turn sound: 18–20 m before the turn starts (AgOpenGPS sndBoundaryAlarm).</summary>
+    public bool ApproachAlarmSound { get; set; }
 }

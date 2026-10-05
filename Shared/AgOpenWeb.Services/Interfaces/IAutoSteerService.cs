@@ -26,11 +26,27 @@ namespace AgOpenWeb.Services.Interfaces;
 /// </summary>
 public interface IAutoSteerService
 {
+    /// <summary>What the GPS module last sent (raw sentences, rate, missed), for the
+    /// System Data card.</summary>
+    AgOpenWeb.Services.Gps.GpsSentenceMonitor GpsSentences { get; }
+
     /// <summary>
     /// Event fired when the control cycle completes (for UI updates).
     /// Note: UI should not rely on this for control - it's purely observational.
     /// </summary>
     event EventHandler<VehicleStateSnapshot>? StateUpdated;
+
+    /// <summary>A module sent a text message (PGN 221, e.g. AiO board): text, seconds to
+    /// show it, and whether it's a warning (AgOpenGPS: byte 6 == 0 → salmon) (#110).</summary>
+    event Action<string, int, bool>? HardwareMessageReceived;
+
+    /// <summary>
+    /// AutoSteer was engaged but guidance stopped updating for longer than
+    /// <c>AutoSteerService.GuidanceStaleLimit</c> (GPS input or the pipeline stalled), so the
+    /// service stopped steering on its own (#169). Raised once per stall, on the control-loop
+    /// thread; the handler should marshal to the UI and take AutoSteer off.
+    /// </summary>
+    event EventHandler? GuidanceLost;
 
     /// <summary>
     /// Whether auto-steer is enabled and processing GPS data.
@@ -92,6 +108,16 @@ public interface IAutoSteerService
     /// Disengage auto-steer (stop sending steering commands).
     /// </summary>
     void Disengage();
+
+    /// <summary>Stop steering this cycle without disengaging: PGN 254 status 0 while
+    /// reversing with Steer in reverse off, or while a direction change is unclear (#125).</summary>
+    void SetSteerPaused(bool paused);
+
+    /// <summary>Reverse state for the deadzone, which is off in reverse (#110).</summary>
+    void SetReverse(bool isReverse);
+
+    /// <summary>True while the deadzone is holding the sent steer angle (#110).</summary>
+    bool IsInDeadZone { get; }
 
     /// <summary>
     /// Get current latency metrics (for diagnostics display).

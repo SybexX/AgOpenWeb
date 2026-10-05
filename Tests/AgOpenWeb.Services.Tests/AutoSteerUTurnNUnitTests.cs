@@ -11,7 +11,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using AgOpenWeb.IntegrationTests.VirtualModules;
+using AgOpenWeb.VirtualModules;
 using AgOpenWeb.Models;
 using AgOpenWeb.Models.Base;
 using AgOpenWeb.Models.Configuration;
@@ -73,6 +73,9 @@ public class AutoSteerUTurnNUnitTests
         config.Vehicle.AntennaPivot = 0;
         config.Vehicle.AntennaOffset = 0;
         config.Vehicle.MaxSteerAngle = 35;
+        // These drive whole fields at working speed to test U-turn geometry; the steering
+        // speed limits (#106) have their own tests (SteerSpeedLimitTests).
+        config.AutoSteer.MaxSteerSpeed = 0;
         config.Tool.Width = TOOL_WIDTH; // 6m
         config.Tool.HitchLength = 3.0;
         config.Tool.TrailingHitchLength = 3.0;
@@ -108,7 +111,7 @@ public class AutoSteerUTurnNUnitTests
 
         var headingFusion = Substitute.For<IGpsHeadingFusionService>();
         headingFusion.FuseHeading(Arg.Any<double>(), Arg.Any<double>(), Arg.Any<bool>(),
-                Arg.Any<double>(), Arg.Any<double>(), Arg.Any<double>())
+                Arg.Any<double>(), Arg.Any<double>(), Arg.Any<double>(), Arg.Any<bool>())
             .Returns(ci => ci.ArgAt<double>(0)); // Pass through GPS heading
 
         _autoSteer = new AutoSteerService(guidance,
@@ -152,7 +155,7 @@ public class AutoSteerUTurnNUnitTests
 
         var headingFusion = Substitute.For<IGpsHeadingFusionService>();
         headingFusion.FuseHeading(Arg.Any<double>(), Arg.Any<double>(), Arg.Any<bool>(),
-                Arg.Any<double>(), Arg.Any<double>(), Arg.Any<double>())
+                Arg.Any<double>(), Arg.Any<double>(), Arg.Any<double>(), Arg.Any<bool>())
             .Returns(ci => ci.ArgAt<double>(0));
 
         var polygonOffset = Substitute.For<AgOpenWeb.Services.Geometry.IPolygonOffsetService>();
@@ -812,4 +815,168 @@ public class AutoSteerUTurnNUnitTests
                 $"Tractor left field: N={r.Northing:F1} (field: 0-{FIELD_H})");
         }
     }
+
+    /// <summary>
+    /// #163: a manual U-turn in a field with no boundary or headland must complete and
+    /// hand guidance back to the next pass. The auto YouTurn tick (which holds the
+    /// completion checks) is gated on a headland line, so before the fix the turn stayed
+    /// executing forever: U-turn guidance reported the path finished and stopped steering,
+    /// and the tractor drove off in a straight line at its exit heading.
+    /// With the YouTurn toggle off the manual turn must work too (AgOpenGPS offers the
+    /// manual buttons whenever autosteer is on); it used to be cleared the cycle it began.
+    /// </summary>
+    [TestCase(true, 400.0, 2.5, 35.0, TestName = "ManualUTurn_NoBoundaryNoHeadland_CompletesAndFollowsNextPass")]
+    [TestCase(false, 400.0, 2.5, 35.0, TestName = "ManualUTurn_YouTurnToggleOff_CompletesAndFollowsNextPass")]
+    // #156: the reporter's Case Maxxum (2.7 m, 24° → 6.1 m minimum radius) on a 6 m pass.
+    // The old semicircle asked for a 3 m radius; the tractor fell outside it and the turn
+    // was abandoned halfway. At the configured 8 m radius the turn is an omega it can drive.
+    [TestCase(true, 200.0, 2.7, 24.0, TestName = "ManualUTurn_6mPass_24degSteer_CompletesAndFollowsNextPass")]
+    public void ManualUTurn_CompletesAndFollowsNextPass(bool youTurnEnabled, double sectionCm, double wheelbase, double maxSteer)
+    {
+        // 3 sections of sectionCm = the pass width; the turn runs at the configured
+        // 8 m U-turn radius whatever the pass width (#156).
+        for (int i = 0; i < 3; i++)
+            ConfigurationStore.Instance.Tool.SetSectionWidth(i, sectionCm);
+        ConfigurationStore.Instance.Vehicle.Wheelbase = wheelbase;
+        ConfigurationStore.Instance.Vehicle.MaxSteerAngle = maxSteer;
+        CreateFreshPipeline();
+
+        var origin = new Wgs84(ORIGIN_LAT, ORIGIN_LON);
+        _appState.Field.LocalPlane = new LocalPlane(origin, new SharedFieldProperties());
+
+        // No SetBoundary / SetHeadlandLine — the reporter's field had neither.
+        const double abEasting = 100.0;
+        var track = new AgOpenWeb.Models.Track.Track
+        {
+            Name = "AB_Manual",
+            Points = new List<Vec3> { new Vec3(abEasting, 0, 0), new Vec3(abEasting, 100, 0) },
+            Type = AgOpenWeb.Models.Track.TrackType.ABLine
+        };
+        SendGpsAt(abEasting, 45, heading: 0, count: 20);
+        _pipeline.SetActiveTrack(track, passNumber: 0, nudgeOffset: 0, isOnBoundary: false);
+        _pipeline.SetAutoSteerEngaged(true);
+        _pipeline.SetYouTurnEnabled(youTurnEnabled);
+        lock (_results) _results.Clear();
+
+        var allResults = new List<(string phase, GpsCycleResult r)>();
+        double lat = ORIGIN_LAT + 50 / MetersPerDegLat;
+        double lon = ORIGIN_LON + abEasting / MetersPerDegLon;
+        double hdg = 0;
+
+        // Settle on the line heading north, then trigger a manual LEFT turn.
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 60, "approach", allResults);
+        _intents.RequestManualYouTurn(turnLeft: true);
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 600, "turn", allResults);
+
+        var turn = allResults.Where(x => x.phase == "turn").Select(x => x.r).ToList();
+        Assert.That(turn.Any(r => r.YouTurn is { IsExecuting: true }), Is.True,
+            "Manual turn should have started");
+        Assert.That(turn.Any(r => r.YouTurn is { JustCompleted: true }), Is.True,
+            "Manual turn never completed");
+
+        var last = turn[^1];
+        double nextPassE = abEasting - ConfigurationStore.Instance.ActualToolWidth; // left of north
+        Assert.Multiple(() =>
+        {
+            Assert.That(last.YouTurn?.IsExecuting ?? false, Is.False, "Turn still executing at the end");
+            Assert.That(last.Guidance?.HasGuidance ?? false, Is.True, "No guidance after the turn");
+            Assert.That(last.Easting, Is.EqualTo(nextPassE).Within(0.5),
+                $"Should be following the next pass at E={nextPassE:F1}");
+            double hdgErr = Math.Abs(((hdg - 180.0) % 360 + 540) % 360 - 180);
+            Assert.That(hdgErr, Is.LessThan(3.0), $"Heading {hdg:F1}° should be parallel to the AB line (180°)");
+        });
+    }
+
+    /// <summary>
+    /// Switching the YouTurn toggle off mid-turn still drops the turn (AgOpenGPS
+    /// ResetYouTurn on btnAutoYouTurn off) — but only on that edge: a manual turn
+    /// requested afterwards, with the toggle still off, runs.
+    /// </summary>
+    [Test]
+    public void YouTurnToggleOff_ClearsTurnOnce_ThenManualTurnsStillRun()
+    {
+        for (int i = 0; i < 3; i++)
+            ConfigurationStore.Instance.Tool.SetSectionWidth(i, 400.0);
+        CreateFreshPipeline();
+        _appState.Field.LocalPlane = new LocalPlane(new Wgs84(ORIGIN_LAT, ORIGIN_LON), new SharedFieldProperties());
+
+        const double abEasting = 100.0;
+        var track = new AgOpenWeb.Models.Track.Track
+        {
+            Name = "AB_Toggle",
+            Points = new List<Vec3> { new Vec3(abEasting, 0, 0), new Vec3(abEasting, 100, 0) },
+            Type = AgOpenWeb.Models.Track.TrackType.ABLine
+        };
+        SendGpsAt(abEasting, 45, heading: 0, count: 20);
+        _pipeline.SetActiveTrack(track, passNumber: 0, nudgeOffset: 0, isOnBoundary: false);
+        _pipeline.SetAutoSteerEngaged(true);
+        _pipeline.SetYouTurnEnabled(true);
+        lock (_results) _results.Clear();
+
+        var all = new List<(string phase, GpsCycleResult r)>();
+        double lat = ORIGIN_LAT + 50 / MetersPerDegLat, lon = ORIGIN_LON + abEasting / MetersPerDegLon, hdg = 0;
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 60, "approach", all);
+
+        // Start a manual turn, drive into it, then switch the toggle off mid-turn.
+        _intents.RequestManualYouTurn(turnLeft: false);
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 20, "turn1", all);
+        Assume.That(all[^1].r.YouTurn?.IsExecuting ?? false, Is.True, "turn should be executing before the toggle");
+        _pipeline.SetYouTurnEnabled(false);
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 12, "off", all);
+        var afterOff = all[^1].r;
+        Assert.That(afterOff.YouTurn?.IsExecuting ?? true, Is.False, "Toggling off mid-turn must drop the turn");
+        Assert.That(afterOff.YouTurn?.TurnPath, Is.Null, "…and clear its path from the map");
+
+        // Settle back on a line, then request another manual turn with the toggle still off.
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 150, "settle", all);
+        _intents.RequestManualYouTurn(turnLeft: true);
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 400, "turn2", all);
+        var turn2 = all.Where(x => x.phase == "turn2").Select(x => x.r).ToList();
+        Assert.That(turn2.Any(r => r.YouTurn is { IsExecuting: true }), Is.True,
+            "A manual turn with the toggle off must run, not be cleared at once");
+        Assert.That(turn2.Any(r => r.YouTurn is { JustCompleted: true }), Is.True, "…and complete");
+    }
+
+    /// <summary>
+    /// #172: the lateral snap buttons must move to the line on the DRIVER's left/right in
+    /// both driving directions. The direction flag they use was only refreshed by the YouTurn
+    /// tick (auto U-turn on + a headland), so with U-turn off it went stale and the buttons
+    /// swapped when driving against the AB line's direction.
+    /// </summary>
+    [TestCase(0.0, false, +1, TestName = "SnapRight_DrivingWithTheLine_GoesRight")]
+    [TestCase(180.0, false, -1, TestName = "SnapRight_DrivingAgainstTheLine_GoesRight")]
+    [TestCase(180.0, true, +1, TestName = "SnapLeft_DrivingAgainstTheLine_GoesLeft")]
+    public void Snap_moves_to_the_drivers_side(double heading, bool left, int expectedEastSign)
+    {
+        for (int i = 0; i < 3; i++)
+            ConfigurationStore.Instance.Tool.SetSectionWidth(i, 400.0); // 12 m passes
+        CreateFreshPipeline();
+        _appState.Field.LocalPlane = new LocalPlane(new Wgs84(ORIGIN_LAT, ORIGIN_LON), new SharedFieldProperties());
+
+        const double abEasting = 100.0;
+        var track = new AgOpenWeb.Models.Track.Track
+        {
+            Name = "AB_Snap",
+            Points = new List<Vec3> { new Vec3(abEasting, 0, 0), new Vec3(abEasting, 100, 0) },
+            Type = AgOpenWeb.Models.Track.TrackType.ABLine
+        };
+        double startN = heading < 90 ? 40 : 160;
+        SendGpsAt(abEasting, startN, heading: heading, count: 20);
+        _pipeline.SetActiveTrack(track, passNumber: 0, nudgeOffset: 0, isOnBoundary: false);
+        _pipeline.SetAutoSteerEngaged(true);
+        _pipeline.SetYouTurnEnabled(false);
+        lock (_results) _results.Clear();
+
+        var all = new List<(string phase, GpsCycleResult r)>();
+        double lat = ORIGIN_LAT + startN / MetersPerDegLat, lon = ORIGIN_LON + abEasting / MetersPerDegLon, hdg = heading;
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 40, "settle", all);
+        _intents.RequestGuidanceSnap(left: left);
+        DriveWithFeedback(ref lat, ref lon, ref hdg, 8.0, 250, "snap", all);
+
+        double endE = all[^1].r.Easting;
+        double expectedE = abEasting + expectedEastSign * ConfigurationStore.Instance.ActualToolWidth;
+        Assert.That(endE, Is.EqualTo(expectedE).Within(0.5),
+            $"heading {heading}°, snap {(left ? "left" : "right")}: expected the line at E={expectedE:F0}, ended at E={endE:F1}");
+    }
 }
+

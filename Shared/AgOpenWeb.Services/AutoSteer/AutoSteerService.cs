@@ -67,6 +67,9 @@ public class AutoSteerService : IAutoSteerService
     private long _cycleCount;
     private long _parseFailures;
 
+    /// <inheritdoc />
+    public AgOpenWeb.Services.Gps.GpsSentenceMonitor GpsSentences { get; } = new();
+
     // Service state
     private bool _isEnabled;
     private bool _isEngaged;
@@ -83,6 +86,7 @@ public class AutoSteerService : IAutoSteerService
     private bool _configSubscribed;
     private AutoSteerConfig? _subscribedAutoSteer;
     private ToolConfig? _subscribedTool;
+    private MachineConfig? _subscribedMachine;
 
     /// <summary>
     /// Test seam: lets tests shorten the debounce so they don't have
@@ -95,6 +99,7 @@ public class AutoSteerService : IAutoSteerService
     }
 
     public event EventHandler<VehicleStateSnapshot>? StateUpdated;
+    public event Action<string, int, bool>? HardwareMessageReceived;
 
     public bool IsEnabled => _isEnabled;
     public bool IsEngaged => _isEngaged;
@@ -179,6 +184,10 @@ public class AutoSteerService : IAutoSteerService
         _subscribedTool = _configStore.Tool;
         _subscribedAutoSteer.PropertyChanged += OnConfigPropertyChanged;
         _subscribedTool.PropertyChanged += OnConfigPropertyChanged;
+        // Machine config (PGN 238 raise/lower/invert/user values, PGN 236 pins): sent the
+        // same way, so edits and profile loads reach the machine module (#110).
+        _subscribedMachine = _configStore.Machine;
+        _subscribedMachine.PropertyChanged += OnConfigPropertyChanged;
         _configSubscribed = true;
     }
 
@@ -189,6 +198,8 @@ public class AutoSteerService : IAutoSteerService
             _subscribedAutoSteer.PropertyChanged -= OnConfigPropertyChanged;
         if (_subscribedTool != null)
             _subscribedTool.PropertyChanged -= OnConfigPropertyChanged;
+        if (_subscribedMachine != null)
+            _subscribedMachine.PropertyChanged -= OnConfigPropertyChanged;
         _configSubscribed = false;
     }
 
@@ -213,6 +224,10 @@ public class AutoSteerService : IAutoSteerService
             var cfg = _configStore.AutoSteer;
             _udpService.SendToModules(PgnBuilder.BuildSteerConfigPgn(cfg));
             _udpService.SendToModules(PgnBuilder.BuildSteerSettingsPgn(cfg));
+            // AgOpenGPS SendSettings / SendRelaySettingsToMachineModule send PGN 238 and 236
+            // with 251/252 on start and profile load; these were built but never sent (#110).
+            SendMachineConfig();
+            SendMachinePinConfig();
         }
         catch (Exception ex)
         {
@@ -257,7 +272,28 @@ public class AutoSteerService : IAutoSteerService
             case PgnNumbers.SENSOR_DATA: // 250 - Sensor Data from module
                 ProcessSensorData(e.Data);
                 break;
+
+            case PgnNumbers.HARDWARE_MESSAGE: // 221 - text to show on screen
+                if (TryParseHardwareMessage(e.Data, out var text, out int seconds, out bool warning))
+                    HardwareMessageReceived?.Invoke(text, seconds, warning);
+                break;
         }
+    }
+
+    /// <summary>
+    /// PGN 221, as AgOpenGPS reads it: { 0x80, 0x81, 0x7F, 221, length, seconds to show,
+    /// colour (0 = warning), text…, CRC }, text = UTF-8 of (length − 2) bytes from byte 7.
+    /// </summary>
+    public static bool TryParseHardwareMessage(byte[] data, out string text, out int seconds, out bool warning)
+    {
+        text = ""; seconds = 0; warning = false;
+        if (data.Length < 9) return false;
+        int n = Math.Min(data[4] - 2, data.Length - 8); // stop before the CRC
+        if (n <= 0) return false;
+        text = System.Text.Encoding.UTF8.GetString(data, 7, n).TrimEnd('\0');
+        seconds = data[5];
+        warning = data[6] == 0;
+        return text.Length > 0;
     }
 
     /// <summary>
@@ -344,9 +380,44 @@ public class AutoSteerService : IAutoSteerService
     {
         if (_isEnabled)
         {
+            // Start the freshness clock now so the first cycle after engaging has the
+            // full limit to deliver guidance.
+            Volatile.Write(ref _lastGuidanceTicks, Stopwatch.GetTimestamp());
             _isEngaged = true;
             _state.IsAutoSteerEngaged = true;
         }
+    }
+
+    /// <summary>
+    /// How long AutoSteer may stay engaged without a guidance update before steering is
+    /// stopped (#169). PGN 254 goes out at 100 Hz from the control loop whether or not
+    /// guidance is fresh, so the firmware's own lost-connection watchdog (AIO v4: 100 × 25 ms
+    /// without an engaged PGN 254) never trips — AgOpenGPS avoids that by sending PGN 254
+    /// once per GPS fix. 1 s ≈ 10 missed fixes at 10 Hz.
+    /// </summary>
+    public static readonly TimeSpan GuidanceStaleLimit = TimeSpan.FromSeconds(1);
+
+    public event EventHandler? GuidanceLost;
+
+    private long _lastGuidanceTicks;
+
+    /// <summary>
+    /// Control-tick check: engaged but no guidance update within <see cref="GuidanceStaleLimit"/>
+    /// → disengage here (so the very next PGN 254 carries status 0 and the motor stops, even
+    /// if the UI thread is the thing that's stuck) and raise <see cref="GuidanceLost"/> once.
+    /// Steering stays off until the operator re-engages. Free Drive has no guidance and is
+    /// exempt. Exposed for tests with an explicit clock.
+    /// </summary>
+    internal bool CheckGuidanceFreshness(long nowTicks)
+    {
+        if (!_isEngaged || _state.IsInFreeDriveMode) return false;
+        long last = Volatile.Read(ref _lastGuidanceTicks);
+        if (Stopwatch.GetElapsedTime(last, nowTicks) <= GuidanceStaleLimit) return false;
+
+        _isEngaged = false;
+        _state.IsAutoSteerEngaged = false;
+        GuidanceLost?.Invoke(this, EventArgs.Empty);
+        return true;
     }
 
     public void Disengage()
@@ -354,6 +425,8 @@ public class AutoSteerService : IAutoSteerService
         _isEngaged = false;
         _state.IsAutoSteerEngaged = false;
     }
+
+    public void SetSteerPaused(bool paused) => _state.IsSteerPaused = paused;
 
     // ═══════════════════════════════════════════════════════════════════════
     // Free Drive Mode
@@ -420,9 +493,36 @@ public class AutoSteerService : IAutoSteerService
 
     public void UpdateGuidanceResults(double steerAngle, double crossTrackError)
     {
-        _state.SteerAngle = steerAngle;
+        Volatile.Write(ref _lastGuidanceTicks, Stopwatch.GetTimestamp());
         _state.CrossTrackError = crossTrackError;
+
+        // Deadzone (AgOpenGPS Position.designer.cs): while steering forward and the wheel
+        // is within Deadzone heading of the set angle for longer than Deadzone delay (s),
+        // stop updating the steer angle sent in PGN 254, so the motor holds instead of
+        // hunting. Off when not engaged, paused or reversing (#110).
+        var a = _configStore.AutoSteer;
+        bool steering = _state.IsAutoSteerEngaged && !_state.IsSteerPaused && !_isReverse;
+        if (steering && a.DeadzoneHeading > 0
+            && Math.Abs(steerAngle - _state.ActualSteerAngle) < a.DeadzoneHeading)
+        {
+            _deadZoneSince ??= Stopwatch.GetTimestamp();
+            IsInDeadZone = Stopwatch.GetElapsedTime(_deadZoneSince.Value).TotalSeconds > a.DeadzoneDelay;
+        }
+        else
+        {
+            _deadZoneSince = null;
+            IsInDeadZone = false;
+        }
+        if (!IsInDeadZone) _state.SteerAngle = steerAngle;
     }
+
+    private long? _deadZoneSince;
+    private bool _isReverse;
+
+    /// <summary>True while the deadzone is holding the sent steer angle (#110).</summary>
+    public bool IsInDeadZone { get; private set; }
+
+    public void SetReverse(bool isReverse) => _isReverse = isReverse;
 
     /// <summary>
     /// Process incoming GPS buffer — entry point for the zero-copy pipeline.
@@ -452,7 +552,9 @@ public class AutoSteerService : IAutoSteerService
             // its own parse-timing fields; no BeginNewCycle here because the
             // cycle owns timing now.
             ReadOnlySpan<byte> data = buffer.AsSpan(0, length);
-            if (!NmeaParserServiceFast.ParseIntoState(data, ref _state, _configStore))
+            bool parsed = NmeaParserServiceFast.ParseIntoState(data, ref _state, _configStore);
+            GpsSentences.Record(data, parsed);
+            if (!parsed)
             {
                 _parseFailures++;
                 return;
@@ -559,6 +661,8 @@ public class AutoSteerService : IAutoSteerService
             ImuYawRate = _state.YawRate,
             ImuHeading = _state.ImuHeading,
             ImuValid = _state.ImuValid,
+            HasDualHeading = _state.HasDualHeading,
+            SentenceType = _state.SentenceType,
             Timestamp = DateTime.UtcNow,
         };
         _gpsService.UpdateGpsData(gpsData);
@@ -655,7 +759,11 @@ public class AutoSteerService : IAutoSteerService
         bool perf = AgOpenWeb.Models.Diagnostics.DiagFlags.PerfAutoSteer;
         long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
-        try { SendPgns(); }
+        try
+        {
+            CheckGuidanceFreshness(Stopwatch.GetTimestamp());
+            SendPgns();
+        }
         finally
         {
             if (perf)

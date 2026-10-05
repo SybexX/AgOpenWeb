@@ -25,11 +25,12 @@ using AgOpenWeb.Models;
 using AgOpenWeb.Models.Configuration;
 using AgOpenWeb.Services.Interfaces;
 using AgOpenWeb.Services.Logging;
-using Avalonia.Threading;
 using Microsoft.Extensions.Logging;
 using CommunityToolkit.Mvvm.Input;
 
 using CommunityToolkit.Mvvm.ComponentModel;
+
+using AgOpenWeb.Services;
 
 namespace AgOpenWeb.ViewModels;
 
@@ -210,13 +211,15 @@ public partial class MainViewModel
                 catch { /* screenshot is optional */ }
 
                 var zipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, _configStore, screenshotPng: screenshot);
+                    _settingsService, _appState, _configStore, screenshotPng: screenshot,
+                    activeJobTaskName: SaveCoverageForDump(),
+                    ntripRtcmReport: NtripRtcmReport());
                 StatusMessage = $"Debug dump saved: {zipPath}";
                 _logger.LogInformation($"Debug dump created: {zipPath}");
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Debug dump failed: {ex.Message}";
+                ReportFailure($"Debug dump failed: {ex.Message}");
                 _logger.LogError(ex, "Debug dump failed");
             }
         });
@@ -241,12 +244,14 @@ public partial class MainViewModel
             try
             {
                 _bugReportTempZipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, _configStore, screenshotPng: _bugReportScreenshot);
+                    _settingsService, _appState, _configStore, screenshotPng: _bugReportScreenshot,
+                    activeJobTaskName: SaveCoverageForDump(),
+                    ntripRtcmReport: NtripRtcmReport());
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Bug report state-snapshot capture failed");
-                StatusMessage = $"Bug report capture failed: {ex.Message}";
+                ReportFailure($"Bug report capture failed: {ex.Message}");
             }
 
             OpenChainDialog(Models.State.DialogType.BugReport);
@@ -265,8 +270,7 @@ public partial class MainViewModel
                 try
                 {
                     var bugReportsDir = Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                        "AgOpenWeb", "BugReports");
+                        AppDataRoot.Documents, "BugReports");
 
                     var savedPath = Services.DebugDumpService.FinalizeBugReport(
                         sourceZipPath: _bugReportTempZipPath,
@@ -275,7 +279,7 @@ public partial class MainViewModel
                         notes: null,
                         userAttachments: null);
 
-                    StatusMessage = $"Bug report saved (no details): {savedPath}";
+                    ReportFailure($"Bug report saved (no details): {savedPath}");
                     _logger.LogInformation("Bug report saved on cancel: {ZipPath}", savedPath);
                 }
                 catch (Exception ex)
@@ -307,8 +311,7 @@ public partial class MainViewModel
                 await System.Threading.Tasks.Task.Delay(50);
 
                 var bugReportsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "BugReports");
+                    AppDataRoot.Documents, "BugReports");
 
                 // Build filename from title: sanitize, replace spaces with hyphens
                 var titleSlug = string.IsNullOrWhiteSpace(BugReportTitle)
@@ -350,6 +353,8 @@ public partial class MainViewModel
                         _configStore,
                         additionalNotes: notes,
                         screenshotPng: _bugReportScreenshot,
+                        activeJobTaskName: SaveCoverageForDump(),
+                    ntripRtcmReport: NtripRtcmReport(),
                         outputDirectory: bugReportsDir,
                         filePrefix: $"bugreport_{titleSlug}",
                         userAttachments: attachmentPaths);
@@ -366,7 +371,7 @@ public partial class MainViewModel
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Bug report failed: {ex.Message}";
+                ReportFailure($"Bug report failed: {ex.Message}");
                 _logger.LogError(ex, "Bug report creation failed");
             }
             finally
@@ -487,6 +492,23 @@ public partial class MainViewModel
 
         AppDirectories = dirs;
     }
+
+    private string? NtripRtcmReport() => Services.NtripRtcmReport.Build(_ntripService, _gpsService);
+
+    /// <summary>
+    /// Save the active job's coverage so a dump's tiles are current, and return the job's
+    /// task name for <see cref="Services.DebugDumpService.CreateDump"/>; null with no job.
+    /// </summary>
+    private string? SaveCoverageForDump()
+    {
+        var task = _jobService.ActiveJob?.TaskName;
+        var fieldDir = ActiveField?.DirectoryPath;
+        if (string.IsNullOrWhiteSpace(task) || string.IsNullOrEmpty(fieldDir)) return null;
+        try { _coverageMapService.SaveToFile(fieldDir, task); }
+        catch (Exception ex) { _logger.LogWarning(ex, "[Coverage] Save before dump failed"); }
+        return task;
+    }
+
 }
 
 // --- Log Viewer (#22) ---
@@ -631,7 +653,9 @@ public partial class MainViewModel
         global.Items.Add(new SettingsValueItem("Active Profile", store.ActiveVehicleProfileName));
         global.Items.Add(new SettingsValueItem("Is Metric", store.IsMetric.ToString()));
         global.Items.Add(new SettingsValueItem("Num Sections", store.NumSections.ToString()));
-        global.Items.Add(new SettingsValueItem("Actual Tool Width", $"{store.ActualToolWidth:F2} m"));
+        global.Items.Add(new SettingsValueItem("Actual Tool Width",
+            store.IsMetric ? $"{store.ActualToolWidth:F2} m"
+                           : $"{AgOpenWeb.Models.Base.UnitConversion.MetersToFeet(store.ActualToolWidth):F2} ft"));
         SettingsTree.Add(global);
     }
 
@@ -687,6 +711,7 @@ public class SettingsValueItem
         Name = name;
         Value = value;
     }
+
 }
 
 public class AppDirectoryInfo

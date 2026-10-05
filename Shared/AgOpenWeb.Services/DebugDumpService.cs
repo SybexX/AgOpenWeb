@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -43,7 +44,9 @@ public class DebugDumpService
         byte[]? screenshotPng = null,
         string? outputDirectory = null,
         string filePrefix = "debug_dump",
-        IReadOnlyList<string>? userAttachments = null)
+        IReadOnlyList<string>? userAttachments = null,
+        string? activeJobTaskName = null,
+        string? ntripRtcmReport = null)
     {
         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
         var dumpDir = outputDirectory
@@ -60,7 +63,7 @@ public class DebugDumpService
         // 2. App settings
         try
         {
-            var settingsJson = JsonSerializer.Serialize(settingsService.Settings, JsonOptions);
+            var settingsJson = RedactSecrets(JsonSerializer.Serialize(settingsService.Settings, JsonOptions));
             AddTextEntry(archive, "appsettings.json", settingsJson);
         }
         catch (Exception ex)
@@ -101,7 +104,11 @@ public class DebugDumpService
             AddTextEntry(archive, "logs_error.txt", ex.ToString());
         }
 
-        // 5b. GPS data recorder (last 60 seconds of position/guidance/YouTurn)
+        // 5a. What the NTRIP caster sent, by RTCM message, and the receiver's differential age.
+        if (!string.IsNullOrEmpty(ntripRtcmReport))
+            AddTextEntry(archive, "ntrip_rtcm.txt", ntripRtcmReport);
+
+        // 5b. GPS data recorder (last 5 minutes of position/guidance/YouTurn/heading inputs)
         try
         {
             var gpsCsv = Logging.GpsDataRecorder.Instance.ExportCsv();
@@ -162,6 +169,34 @@ public class DebugDumpService
         catch (Exception ex)
         {
             AddTextEntry(archive, "field_error.txt", ex.ToString());
+        }
+
+        // 6b. The active job's folder: its coverage tiles (worked area) and job file,
+        // so coverage display bugs can be reproduced from the dump (#175). The caller
+        // saves coverage first; the tiles on disk are otherwise up to an autosave old.
+        try
+        {
+            var fieldDir = appState.Field.ActiveField?.DirectoryPath;
+            if (!string.IsNullOrEmpty(fieldDir) && !string.IsNullOrWhiteSpace(activeJobTaskName))
+            {
+                var jobDir = Path.Combine(fieldDir, "jobs", activeJobTaskName);
+                if (Directory.Exists(jobDir))
+                {
+                    foreach (var file in Directory.GetFiles(jobDir, "*", SearchOption.AllDirectories))
+                    {
+                        if (new FileInfo(file).Length > 20_000_000) continue;
+                        var relative = Path.GetRelativePath(fieldDir, file).Replace('\\', '/');
+                        var entry = archive.CreateEntry($"field/{relative}");
+                        using var entryStream = entry.Open();
+                        using var fileStream = File.OpenRead(file);
+                        fileStream.CopyTo(entryStream);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AddTextEntry(archive, "job_error.txt", ex.ToString());
         }
 
         // 7. Current vehicle profile
@@ -351,11 +386,63 @@ public class DebugDumpService
                 store.Guidance.StanleyDistanceErrorGain,
                 store.Guidance.UTurnRadius
             },
+            // GPS / dual-antenna / heading settings (#157: a heading bug report had none of
+            // these). ConnectionConfig also holds NTRIP and AgShare credentials — listed
+            // field by field so those can never ride along.
+            Gps = new
+            {
+                store.Connections.IsDualGps,
+                store.Connections.DualHeadingOffset,
+                store.Connections.DualReverseDistance,
+                store.Connections.AutoDualFix,
+                store.Connections.DualSwitchSpeed,
+                store.Connections.GpsUpdateRate,
+                store.Connections.UseRtk,
+                store.Connections.MinGpsStep,
+                store.Connections.FixToFixDistance,
+                store.Connections.HeadingFusionWeight,
+                store.Connections.ReverseDetection,
+                store.Connections.HeadingSource,
+                store.Connections.MinFixQuality,
+                store.Connections.RtkLostAlarm,
+                store.Connections.RtkLostAction,
+                store.Connections.MaxDifferentialAge,
+                store.Connections.MaxHdop
+            },
+            Ahrs = store.Ahrs,
+            AutoSteer = store.AutoSteer,
             NumSections = store.NumSections,
+            // Pass spacing and coverage width come from these, not Tool.Width.
+            SectionWidthsCm = store.Tool.SectionWidths.Take(Math.Max(0, store.NumSections)).ToArray(),
+            ActualToolWidth = store.ActualToolWidth,
             IsMetric = store.IsMetric,
-            ActiveProfile = store.ActiveVehicleProfileName
+            ActiveProfile = store.ActiveVehicleProfileName,
+            ActiveToolProfile = store.ActiveToolProfileName
         };
         return JsonSerializer.Serialize(snapshot, JsonOptions);
+    }
+
+    /// <summary>
+    /// Bug reports get attached to public issues: blank out anything credential-shaped
+    /// (NTRIP user/password, AgShare API key, …) that's set. Empty values stay empty so
+    /// the report still shows whether one was configured.
+    /// </summary>
+    internal static string RedactSecrets(string json)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(json);
+        if (node is not System.Text.Json.Nodes.JsonObject obj) return json;
+        foreach (var key in new List<string>(obj.Select(kv => kv.Key)))
+        {
+            bool secret = key.Contains("Password", StringComparison.OrdinalIgnoreCase)
+                || key.Contains("ApiKey", StringComparison.OrdinalIgnoreCase)
+                || key.Contains("Token", StringComparison.OrdinalIgnoreCase)
+                || key.Contains("Secret", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("NtripUsername", StringComparison.OrdinalIgnoreCase);
+            if (secret && obj[key] is System.Text.Json.Nodes.JsonValue v
+                && v.TryGetValue<string>(out var str) && !string.IsNullOrEmpty(str))
+                obj[key] = "REDACTED";
+        }
+        return obj.ToJsonString(JsonOptions);
     }
 
     private static string BuildStateSnapshot(ApplicationState state)

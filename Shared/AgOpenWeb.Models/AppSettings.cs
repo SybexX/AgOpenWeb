@@ -33,17 +33,20 @@ namespace AgOpenWeb.Models
         public bool HeadlandDistanceVisible { get; set; } = true;
         public bool ExtraGuidelines { get; set; } = false;
         public int ExtraGuidelinesCount { get; set; } = 10;
-        public bool AutoTrack { get; set; } = true;
+        public bool AutoTrack { get; set; } = false; // AgOpenGPS default (see DisplayConfig)
         public bool FieldTextureVisible { get; set; } = true;
-        public bool FieldTextureMoveable { get; set; } = false;
+        public bool FieldTextureMoveable { get; set; } = true;
+        /// <summary>One-shot latch (#110): Texture Moves used to do nothing while the saved
+        /// value defaulted to false; it now does something, so saved values are reset to
+        /// true (the texture keeps scrolling, as before) once.</summary>
+        public bool HasMigratedTextureMoveable { get; set; } = false;
 
         /// <summary>
         /// Device-/user-scoped metric vs imperial preference. The source of
         /// truth lives here (in AppSettings); vehicle profiles must not
-        /// dictate units. Default false (imperial) matches the legacy
-        /// per-vehicle default before the migration.
+        /// dictate units. Default true (metric).
         /// </summary>
-        public bool IsMetric { get; set; } = false;
+        public bool IsMetric { get; set; } = true;
 
         /// <summary>
         /// One-shot migration latch: if false, the next vehicle-profile
@@ -141,6 +144,13 @@ namespace AgOpenWeb.Models
         public string AgShareServer { get; set; } = "https://agshare.agopengps.com";
         public string AgShareApiKey { get; set; } = string.Empty;
         public bool AgShareEnabled { get; set; } = false;
+
+        /// <summary>Always broadcast RTCM to the modules' subnet (default: unicast to the
+        /// GPS module when its address is known).</summary>
+        public bool RtcmBroadcast { get; set; } = false;
+
+        /// <summary>NTRIP on/off (Network IO). Off: the app does not connect to a caster.</summary>
+        public bool NtripEnabled { get; set; } = true;
 
         // Vehicle profile settings
         public string LastUsedVehicleProfile { get; set; } = string.Empty;

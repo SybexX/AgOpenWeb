@@ -19,7 +19,7 @@ namespace AgOpenWeb.Services.Tests;
 /// <see cref="VehicleState.IsInFreeDriveMode"/> was true. The
 /// receiver's engagement gate, however, checks bit <c>0x04</c>
 /// (IsAutoSteerEngaged) — see <c>PgnProtocol.ParseAutoSteerCommand</c>
-/// in the simulator's PgnProtocol.cs. The PID therefore stayed in
+/// in AgOpenWeb.Models/Communication. The PID therefore stayed in
 /// the "not engaged → pwm = 0" branch and the wheels never moved.
 /// </summary>
 [TestFixture]
@@ -41,16 +41,14 @@ public class FreeDrivePgnEngagementTests
     }
 
     [Test]
-    public void FreeDrivePgn254_StatusByte_HasAutoSteerEngagedBit()
+    public void FreeDrivePgn254_StatusByte_Is1()
     {
-        // 0x04 is the bit the receiver's parser inspects for "is engaged".
+        // Status 1 = steer, which the firmware reads from bit 0 (AgOpenGPS sends 1
+        // in free drive: "turn on status to operate"). #125.
         var packet = BuildFreeDrivePgn(angleDeg: 5.0);
-        byte status = packet[7];
-
-        Assert.That(status & 0x04, Is.Not.Zero,
-            "Free-drive PGN 254 must set the IsAutoSteerEngaged bit (0x04) " +
-            "so the firmware/simulator PID engages and drives toward the " +
-            "commanded angle. Without it the wizard's motor ramp is a no-op.");
+        Assert.That(packet[7], Is.EqualTo(1),
+            "Free-drive PGN 254 must send status 1 so the firmware drives toward " +
+            "the commanded angle. Without it the wizard's motor ramp is a no-op.");
     }
 
     [Test]

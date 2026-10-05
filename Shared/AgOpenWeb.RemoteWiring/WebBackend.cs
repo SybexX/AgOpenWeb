@@ -44,6 +44,9 @@ public sealed class WebBackend
     public static async Task<WebBackend> StartAsync(IServiceProvider sp, IBoundaryImageryCapture imageryCapture)
     {
         // Persisted settings → ConfigurationStore, then app config + persistent state.
+        // Slow-work reporting on the host loop (#169) once logging is available.
+        if (sp.GetService<IUiDispatcher>() is AgOpenWeb.Services.Threading.HostLoopDispatcher hostLoop)
+            hostLoop.Logger = sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("HostLoop");
         sp.GetRequiredService<ISettingsService>().Load();
         var configService = sp.GetRequiredService<IConfigurationService>();
         configService.LoadAppSettings();
@@ -72,7 +75,8 @@ public sealed class WebBackend
             sp.GetRequiredService<IFieldService>(),
             sp.GetRequiredService<ISettingsService>(),
             sp.GetRequiredService<IVehicleProfileService>(),
-            sp.GetRequiredService<IPersistentStateService>()).ConfigureAwait(false);
+            sp.GetRequiredService<IPersistentStateService>(),
+            sp.GetService<INtripClientService>()).ConfigureAwait(false);
 
         // Wire on the host loop so the command handler runs serialized with the render-pull /
         // status timers, exactly as the Avalonia UI thread did in the old windowed build.

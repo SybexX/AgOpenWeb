@@ -21,6 +21,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using AgOpenWeb.Models;
 using AgOpenWeb.Services.AutoSteer;
 using AgOpenWeb.Services.Interfaces;
@@ -60,9 +62,6 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
     private const int ModuleTimeoutSeconds = 5;
     private const int DiscoveryRefreshSeconds = 30;
 
-    // Hello packet: [0x80, 0x81, 0x7F, 200, 3, 56, 0, 0, CRC]
-    private readonly byte[] _helloPacket = { 0x80, 0x81, 0x7F, 200, 3, 56, 0, 0, 0x47 };
-
     // Module connection tracking - Hello responses (2 second timeout)
     private DateTime _lastHelloFromAutoSteer = DateTime.MinValue;
     private DateTime _lastHelloFromMachine = DateTime.MinValue;
@@ -82,17 +81,27 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
     private string? _gpsIp;
     private string? _moduleSubnet;
 
-    private const int HELLO_TIMEOUT_MS = 2000; // 2 seconds for hello response
-    private const int DATA_TIMEOUT_STEER_MACHINE_MS = 100; // 50Hz data = 20ms cycle, allow 100ms
-    private const int DATA_TIMEOUT_IMU_MS = 300; // 10Hz data = 100ms cycle, allow 300ms
+    private const int HELLO_TIMEOUT_MS = 3000; // 3 seconds for hello response (tolerates Wi-Fi jitter)
+    private const int DATA_TIMEOUT_STEER_MACHINE_MS = 1500; // 50Hz data, allow 1500ms for Wi-Fi latency jitter
+    private const int DATA_TIMEOUT_IMU_MS = 1500; // 10Hz data, allow 1500ms for Wi-Fi latency jitter
+
+    // #169 diagnostics: log once when GPS NMEA or steer PGN 253 stops for over 2 s and once
+    // when it resumes (with the gap), so a bug-report log shows what the board stopped sending.
+    private const string SourceGpsNmea = "GPS NMEA";
+    private const string SourceSteerPgn253 = "steer PGN 253";
+    private readonly SourceSilenceMonitor _silence = new();
+    private readonly ILogger<UdpCommunicationService> _logger;
 
     public bool IsConnected { get; private set; }
     public string? LocalIPAddress { get; private set; }
 
-    public UdpCommunicationService(ILocalNetworkInfoProvider localNetworkInfoProvider)
+    public UdpCommunicationService(
+        ILocalNetworkInfoProvider localNetworkInfoProvider,
+        ILogger<UdpCommunicationService>? logger = null)
     {
         _localNetworkInfoProvider = localNetworkInfoProvider
             ?? throw new ArgumentNullException(nameof(localNetworkInfoProvider));
+        _logger = logger ?? NullLogger<UdpCommunicationService>.Instance;
     }
 
     /// <summary>
@@ -119,8 +128,8 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
             _udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
             _udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 
-            // Reduce receive buffer to minimize packet buffering/delay
-            _udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 8192);
+            // 64 KB receive buffer to absorb Wi-Fi bursts without kernel packet drops
+            _udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 65536);
 
             // Windows: an ICMP Port Unreachable from a peer on a prior Send would
             // otherwise surface as a SocketException (ConnectionReset) on the next
@@ -163,6 +172,7 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
         _udpSocket?.Dispose();
         _udpSocket = null;
         IsConnected = false;
+        _silence.Reset();
 
         await Task.CompletedTask;
     }
@@ -233,7 +243,7 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
 
     public void SendHelloPacket()
     {
-        SendToModules(_helloPacket);
+        SendToModules(PgnBuilder.BuildHelloPacket());
     }
 
     public bool IsModuleHelloOk(ModuleType moduleType)
@@ -276,10 +286,15 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
             catch { }
         }
 
-        // Keep the task alive until cancellation
+        // Keep the task alive until cancellation; also the 100 ms tick for silence checks.
         while (!cancellationToken.IsCancellationRequested)
         {
             await Task.Delay(100, cancellationToken);
+            foreach (var (name, silentMs, from) in _silence.CheckSilences())
+            {
+                _logger.LogWarning("[UDP] no {Source} for {Sec:F1}s (last from {From})",
+                    name, silentMs / 1000.0, from ?? "?");
+            }
         }
     }
 
@@ -370,6 +385,8 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
             }
             else if (data.Length > 0 && data[0] == (byte)'$')
             {
+                MarkSourceSeen(SourceGpsNmea, remoteEndPoint);
+
                 // Text NMEA sentence (starts with $)
                 // Fire event with PGN 0 to indicate NMEA text
                 DataReceived?.Invoke(this, new UdpDataReceivedEventArgs
@@ -491,6 +508,8 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
             case PgnNumbers.AUTOSTEER_DATA2:      // 254
             case PgnNumbers.STEER_SETTINGS:       // 252
             case PgnNumbers.STEER_CONFIG:         // 251
+                if (pgn == PgnNumbers.AUTOSTEER_DATA)
+                    MarkSourceSeen(SourceSteerPgn253, remoteEndPoint);
                 _lastDataFromAutoSteer = now;
                 _autoSteerIp = remoteIp;
                 _lastModuleResponse = DateTime.UtcNow;
@@ -519,6 +538,15 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
         }
     }
 
+    private void MarkSourceSeen(string source, IPEndPoint remoteEndPoint)
+    {
+        if (_silence.MarkSeen(source, remoteEndPoint.Address.ToString()) is { } gapMs)
+        {
+            _logger.LogWarning("[UDP] {Source} resumed after {Sec:F1}s silence (from {From})",
+                source, gapMs / 1000.0, remoteEndPoint.Address);
+        }
+    }
+
     /// <summary>
     /// Returns the most-recently-observed remote IP for the given module, or null
     /// if no packet has ever been received from it.
@@ -528,7 +556,8 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
         ModuleType.AutoSteer => _autoSteerIp,
         ModuleType.Machine   => _machineIp,
         ModuleType.IMU       => _imuIp,
-        ModuleType.GPS       => _gpsIp,
+        // Where the position sentences are coming from; a scan reply's address otherwise.
+        ModuleType.GPS       => GetGpsSourceAddress()?.ToString() ?? _gpsIp,
         _                    => null,
     };
 
@@ -537,6 +566,24 @@ public class UdpCommunicationService : IUdpCommunicationService, IDisposable
     /// a PGN 203 scan reply, or null if no scan reply has been seen.
     /// </summary>
     public string? GetModuleSubnet() => _moduleSubnet;
+
+    public IPAddress? GetGpsSourceAddress(double maxAgeSeconds = 10)
+    {
+        if (_silence.LastSeen(SourceGpsNmea) is not { } seen || seen.AgeMs > maxAgeSeconds * 1000.0)
+            return null;
+        return IPAddress.TryParse(seen.From, out var address) ? address : null;
+    }
+
+    public string? GetActiveModuleSubnet()
+    {
+        var locked = _lockedEndpoint;
+        if (locked != null)
+        {
+            var b = locked.Address.GetAddressBytes();
+            return $"{b[0]}.{b[1]}.{b[2]}";
+        }
+        return _moduleSubnet;
+    }
 
     /// <summary>
     /// Broadcast a scan request (PGN 202). Modules reply with PGN 203 (parsed in

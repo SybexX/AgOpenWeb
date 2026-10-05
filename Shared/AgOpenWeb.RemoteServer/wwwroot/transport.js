@@ -24,7 +24,7 @@ window.RemoteTransport = {
     const url = `${proto}//${location.host}/ws`;
     let ws = null, stopped = false;
 
-    const TYPE = { SCENE: 1, TICK: 2, COVERAGE_INIT: 3, COVERAGE_CELLS: 4, STATUS: 5, CONTROL_STATE: 6, HELLO: 7, CONFIG: 8, PROFILES: 9, WIZARD: 10, NTRIP_PROFILES: 11, FIELD_OPS: 12, AGSHARE: 13, APP_INFO: 14, FIELD_TOOLS: 15, RECORDED_PATH: 16, BOUNDARY: 17, SOUND: 18, PONG: 19, COVERAGE_EDGE: 20, VIEW_PREFS: 21 };
+    const TYPE = { SCENE: 1, TICK: 2, COVERAGE_INIT: 3, COVERAGE_CELLS: 4, STATUS: 5, CONTROL_STATE: 6, HELLO: 7, CONFIG: 8, PROFILES: 9, WIZARD: 10, NTRIP_PROFILES: 11, FIELD_OPS: 12, AGSHARE: 13, APP_INFO: 14, FIELD_TOOLS: 15, RECORDED_PATH: 16, BOUNDARY: 17, SOUND: 18, PONG: 19, COVERAGE_EDGE: 20, VIEW_PREFS: 21, PROMPT: 22, TOAST: 23, DRIVE_PICK: 24, HW_MSG: 25 };
     const td = new TextDecoder();
 
     function decode(buffer) {
@@ -71,10 +71,15 @@ window.RemoteTransport = {
             tramSystems[k] = { index: i32(), name: str(), refLabel: str(), width: f64(), mode: i32(), offset: f64(), direction: i32(), passCount: i32(), enabled: !!u8(), isBoundary: !!u8() };
           const tlc2 = i32(); const tramLines = new Array(tlc2);
           for (let k = 0; k < tlc2; k++) tramLines[k] = pts();
+          const rpc = i32(); const recordedPaths = new Array(rpc); // #110
+          for (let k = 0; k < rpc; k++) recordedPaths[k] = pts();
+          const csc = i32(); const contourStrips = new Array(csc);
+          for (let k = 0; k < csc; k++) contourStrips[k] = pts();
+          const contourRef = optPts(), contourLocked = !!u8();
           handlers.onScene && handlers.onScene({
             version, originLat, originLon, fieldName, hasField, boundaries, boundaryInner, tracks,
             headland, guidanceLine, toolSections, uTurnPath, nextTrack, flags, imagery, trackList,
-            headlandSegs, tramSystems, tramLines,
+            headlandSegs, tramSystems, tramLines, recordedPaths, contourStrips, contourRef, contourLocked,
           });
           break;
         }
@@ -97,7 +102,7 @@ window.RemoteTransport = {
           // Bottom-nav field-tools (Phase 8).
           const tools = {
             headlandOn: !!u8(), sectionInHeadland: !!u8(), autoTrack: !!u8(),
-            skipRows: u8(), skipRowsOn: !!u8(), tramMode: u8(),
+            skipRows: u8(), skipMode: u8(), tramMode: u8(),
           };
           const headlandDist = f32(), headlandWarn = !!u8();
           const steerAngleError = f32();
@@ -108,12 +113,18 @@ window.RemoteTransport = {
           const hostMs = f64(); // host monotonic build time — the interp timeline
           op.executing = !!u8(); // #50 — u-turn arc executing (blocks on-screen U-turn/Lateral)
           op.passNumber = i32(); // guidance pass offset (0 = on reference) — reference gate + label
+          op.nudgeOffset = f32(); // driver-relative line nudge (m, +right) — AB flyout readout (#93)
+          const hasGoal = !!u8(); const goalE = f64(), goalN = f64();
+          const goal = hasGoal ? { e: goalE, n: goalN } : null; // Pure Pursuit target (#95)
+          op.reverse = !!u8(); // #125 — vehicle reversing
+          op.moduleNotSteering = !!u8(); // #126 — engaged, module reports not steering
+          const chartGpsHeading = f32(); // #111 — heading chart, GPS fix-to-fix
           handlers.onTick && handlers.onTick({
             sceneVersion, pose, fix, sections, crossTrackError, guidanceActive, lineLabel,
             activeTrackName: atn.length ? atn : null, tool, op, roll, tools,
             headlandDist, headlandWarn, steerAngleError,
             chartSetSteer, chartActualSteer, chartPwm, chartImuHeading,
-            hitchE, hitchN, vehicleSteerAngle, hostMs,
+            hitchE, hitchN, vehicleSteerAngle, hostMs, goal, chartGpsHeading,
           });
           break;
         }
@@ -132,12 +143,33 @@ window.RemoteTransport = {
                 swStdDev = f32(), swOffsetDeg = f32(), swConfidence = f32(), swValid = !!u8();
           // Network IO panel (append-only).
           const gpsIp = str(), moduleSubnet = str(), hostIps = str();
-          const ntripConnected = !!u8(), ntripStatus = str(), ntripBytes = f64(), ntripTestStatus = str();
+          const ntripConnected = !!u8(), ntripStatus = str(), ntripBytes = f64();
+          const ntripDestination = str(), ntripUnicast = !!u8(), rtcmBroadcast = !!u8(), ntripEnabled = !!u8();
+          const ntripTestStatus = str();
           const simPanelVisible = !!u8();
           const driftEasting = f32(), driftNorthing = f32();
           const unsavedCoveragePrompt = !!u8();
           // Dev diagnostics row (append-only): overlay gate + host control-loop latency (ms).
           const devOverlay = !!u8(), gpsToPgnLatencyMs = f32();
+          // GPS source (append-only, #157): incoming sentence + Dual-on-without-dual-heading.
+          const gpsSentence = str(), dualHeadingMissing = !!u8();
+          // NTRIP RTCM stream (append-only): totals + per-type rows; null with no session.
+          let ntripRtcm = null;
+          if (u8()) {
+            ntripRtcm = { sessionSeconds: f32(), messages: i32(), checksumFailures: i32(), bytesSkipped: i32(),
+                          notSent: i32(), unframed: !!u8(), types: [] };
+            for (let k = i32(); k > 0; k--)
+              ntripRtcm.types.push({ type: i32(), count: i32(), every: f32(), last: f32() });
+          }
+          // System Data card (append-only): attitude, heading sources (NaN = none), sentence
+          // rate + counters, and the latest raw sentences; null before any GPS data.
+          let systemData = null;
+          if (u8()) {
+            systemData = { pitch: f32(), yawRate: f32(), imuHeading: f32(), dualHeading: f32(), fixToFixHeading: f32(),
+                           rateHz: f32(), missed: i32(), rejected: i32(), sentences: [] };
+            for (let k = u8(); k > 0; k--)
+              systemData.sentences.push({ type: str(), text: str(), age: f32() });
+          }
           handlers.onStatusBar && handlers.onStatusBar({
             fixQuality, fixText, age, sats, isMetric,
             gpsOk, imuOk, autoSteerOk, machineOk, imuIp, autoSteerIp, machineIp,
@@ -146,9 +178,9 @@ window.RemoteTransport = {
             simEnabled, simSpeedKph, simSteerAngle, sim10x,
             actualSteerAngle, sensorPercent, setSteerAngle, freeDriveAngle, steerFreeDrive,
             swCollecting, swSamples, swMean, swMedian, swStdDev, swOffsetDeg, swConfidence, swValid,
-            gpsIp, moduleSubnet, hostIps, ntripConnected, ntripStatus, ntripBytes, ntripTestStatus,
+            gpsIp, moduleSubnet, hostIps, ntripConnected, ntripStatus, ntripBytes, ntripDestination, ntripUnicast, rtcmBroadcast, ntripEnabled, ntripTestStatus,
             simPanelVisible, driftEasting, driftNorthing, unsavedCoveragePrompt,
-            devOverlay, gpsToPgnLatencyMs,
+            devOverlay, gpsToPgnLatencyMs, gpsSentence, dualHeadingMissing, ntripRtcm, systemData,
           });
           break;
         }
@@ -219,7 +251,7 @@ window.RemoteTransport = {
         }
         case TYPE.BOUNDARY: {
           const ic = i32(); const items = new Array(ic);
-          for (let k = 0; k < ic; k++) items[k] = { index: i32(), boundaryType: str(), areaDisplay: str(), driveThru: !!u8(), hard: !!u8() };
+          for (let k = 0; k < ic; k++) items[k] = { index: i32(), boundaryType: str(), areaHa: f64(), driveThru: !!u8(), hard: !!u8() };
           const selectedIndex = i32(), playerVisible = !!u8(), isRecording = !!u8(), isPaused = !!u8();
           const pointCount = i32(), areaHa = f64(), offsetCm = f64();
           const drawRightSide = !!u8(), drawAtPivot = !!u8(), sectionControlOn = !!u8();
@@ -258,7 +290,7 @@ window.RemoteTransport = {
             isSteerSwitchEnabled: !!u8(), isSteerSwitchManualSections: !!u8(), totalWidth: f64(),
           };
           const uturn = { style: i32(), extension: f64(), smoothing: i32(), radius: f64(), distanceFromBoundary: f64() };
-          const tram = { passes: i32(), display: !!u8(), line: i32() };
+          const tram = { passes: i32(), display: !!u8(), line: i32(), width: f64() };
           const machine = {
             hydraulicLiftEnabled: !!u8(), raiseTime: i32(), lookAhead: f64(), lowerTime: i32(), invertRelay: !!u8(),
             user1: i32(), user2: i32(), user3: i32(), user4: i32(), pinAssignments: rdI32(),
@@ -300,12 +332,14 @@ window.RemoteTransport = {
           const liveAngle = f32(), liveRoll = f32(), liveError = f32();
           const testPhase = str(), testResult = str(), testProgress = f32(), testActive = !!u8();
           const rtkFixed = !!u8(), fixLabel = str(), diameter = f32();
+          const recordHint = str(), canRecord = !!u8();
           handlers.onWizard && handlers.onWizard({
             stepIndex, totalSteps, stepKind, title, description,
             canBack, canNext, canSkip, isLast, validation,
             statusWas, statusRoll, statusGps, statusSpeed, statusPwm, statusConnected,
             hardwareLevel, liveAngle, liveRoll, liveError,
             testPhase, testResult, testProgress, testActive, rtkFixed, fixLabel, diameter,
+            recordHint, canRecord,
           });
           break;
         }
@@ -356,11 +390,35 @@ window.RemoteTransport = {
           handlers.onPong && handlers.onPong(token);
           break;
         }
+        case TYPE.PROMPT: {
+          // Host's pending confirm/error dialog (#109). kind 0 = none, 1 = confirm, 2 = error.
+          const seq = i32(), kind = u8(), title = str(), message = str();
+          const confirmLabel = str(), cancelLabel = str(), checkboxLabel = str(), checkboxChecked = !!u8();
+          handlers.onPrompt && handlers.onPrompt({ seq, kind, title, message, confirmLabel, cancelLabel, checkboxLabel, checkboxChecked });
+          break;
+        }
+        case TYPE.HW_MSG: { // module hardware message, PGN 221 (#110)
+          const text = str(), seconds = i32(), warning = !!u8();
+          handlers.onHardwareMessage && handlers.onHardwareMessage(text, seconds, warning);
+          break;
+        }
+        case TYPE.TOAST: {
+          // One-shot refusal/failure notification (#109).
+          handlers.onToast && handlers.onToast(str());
+          break;
+        }
+        case TYPE.DRIVE_PICK: {
+          // Drive In found 2+ fields within 0.5 km (#109): name, distance km, area ha.
+          const n = i32(); const fields = new Array(n);
+          for (let k = 0; k < n; k++) fields[k] = { name: str(), distanceKm: f64(), areaHa: f64() };
+          handlers.onDrivePick && handlers.onDrivePick(fields);
+          break;
+        }
         case TYPE.VIEW_PREFS: {
           // Persisted web-camera view (issue #35): pitch radians + zoom px/m, sent
           // once in the seed. The client restores its last tilt+zoom from this.
-          const pitch = f64(); const zoom = f64();
-          handlers.onViewPrefs && handlers.onViewPrefs(pitch, zoom);
+          const pitch = f64(); const zoom = f64(); const mode = u8(); // + follow mode (#176)
+          handlers.onViewPrefs && handlers.onViewPrefs(pitch, zoom, mode);
           break;
         }
       }

@@ -89,6 +89,25 @@ public class ConnectionConfig : ObservableObject
         set => SetProperty(ref _agShareEnabled, value);
     }
 
+    // RTCM corrections go to the GPS module's own address when it is known. On: always
+    // broadcast them to the modules' subnet, as AgIO does, for a setup where something
+    // other than the module sending positions needs them too.
+    private bool _rtcmBroadcast;
+    public bool RtcmBroadcast
+    {
+        get => _rtcmBroadcast;
+        set => SetProperty(ref _rtcmBroadcast, value);
+    }
+
+    // NTRIP on/off (Network IO). Off: no connection to a caster at all, for work where
+    // there is no mobile coverage and the connection would only keep retrying.
+    private bool _ntripEnabled = true;
+    public bool NtripEnabled
+    {
+        get => _ntripEnabled;
+        set => SetProperty(ref _ntripEnabled, value);
+    }
+
     // GPS Mode
     private bool _isDualGps;
     public bool IsDualGps
@@ -112,7 +131,7 @@ public class ConnectionConfig : ObservableObject
     }
 
     // Dual Antenna Settings
-    private double _dualHeadingOffset = 90.0;
+    private double _dualHeadingOffset = 0.0; // AgOpenGPS setGPS_dualHeadingOffset (#112)
     public double DualHeadingOffset
     {
         get => _dualHeadingOffset;
@@ -155,7 +174,9 @@ public class ConnectionConfig : ObservableObject
         set => SetProperty(ref _fixToFixDistance, value);
     }
 
-    private double _headingFusionWeight = 0.7;
+    // GPS share of the IMU/GPS heading fusion, 0–1 (the web slider). AgOpenGPS default
+    // 30% GPS = fusionWeight 0.06; see GpsHeadingFusionService.FusionShareToWeight (#112).
+    private double _headingFusionWeight = 0.3;
     public double HeadingFusionWeight
     {
         get => _headingFusionWeight;

@@ -14,6 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 
@@ -97,11 +100,47 @@ public abstract class WizardStepViewModel : ObservableObject
             if (oldValue != value)
             {
                 if (value)
-                    OnEntering();
+                {
+                    // Values loaded from the store on entry aren't the step's own changes.
+                    _touched.Clear();
+                    _loading = true;
+                    try { OnEntering(); }
+                    finally { _loading = false; }
+                }
                 else
                     OnLeaving();
             }
         }
+    }
+
+    // Properties the step itself changed while active — a calibration action's result
+    // (Zero WAS, CPD / Ackermann / motor tests), a native binding, or remote wizard.set.
+    // OnLeaving writes back ONLY these: the web edits wizard fields straight into the
+    // ConfigurationStore (config.set), so writing the whole entry-time copy back reverted
+    // every web edit on Next/Back (#108).
+    private readonly HashSet<string> _touched = new();
+    private bool _loading;
+
+    protected override void OnPropertyChanged(PropertyChangedEventArgs e)
+    {
+        base.OnPropertyChanged(e);
+        if (!_loading && e.PropertyName != null)
+            _touched.Add(e.PropertyName);
+    }
+
+    /// <summary>Whether this step changed <paramref name="propertyName"/> since it was entered.</summary>
+    protected bool Touched(string propertyName) => _touched.Contains(propertyName);
+
+    /// <summary>
+    /// Set properties that mirror a value the step already wrote to the store, without
+    /// marking them touched — so OnLeaving won't write the mirror back over a later edit.
+    /// </summary>
+    protected void SetUntouched(Action set)
+    {
+        bool was = _loading;
+        _loading = true;
+        try { set(); }
+        finally { _loading = was; }
     }
 
     /// <summary>

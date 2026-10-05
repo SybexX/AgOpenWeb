@@ -107,7 +107,14 @@ public partial class MainViewModel
                 MountPoint = NtripMountPoint,
                 Username = NtripUsername,
                 Password = NtripPassword,
-                SubnetAddress = "192.168.5",
+                // The modules' /24 as discovered (followed live), else the Network IO
+                // subnet (default 192.168.5) — AgIO sends to its subnet setting.
+                SubnetAddress = $"{SubnetOctet1}.{SubnetOctet2}.{SubnetOctet3}",
+                SubnetProvider = _udpService.GetActiveModuleSubnet,
+                // Unicast to the module the position sentences come from, unless the
+                // operator asked for the broadcast (Network IO).
+                GpsModuleAddressProvider = () => _udpService.GetGpsSourceAddress(),
+                BroadcastOnly = () => ConfigStore.Connections.RtcmBroadcast,
                 UdpForwardPort = 2233,
                 GgaIntervalSeconds = 10,
                 UseManualPosition = false
@@ -124,6 +131,36 @@ public partial class MainViewModel
     public async Task DisconnectFromNtripAsync()
     {
         await _ntripService.DisconnectAsync();
+    }
+
+    /// <summary>
+    /// The NTRIP on/off box in Network IO (#278). Off drops the connection and ends the
+    /// retries; on connects as a start-up or a field open would, with the open field's
+    /// profile or the default one.
+    /// </summary>
+    private void OnNtripEnabledChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(Models.Configuration.ConnectionConfig.NtripEnabled)) return;
+        _ = ApplyNtripEnabledAsync(ConfigStore.Connections.NtripEnabled);
+    }
+
+    private async Task ApplyNtripEnabledAsync(bool enabled)
+    {
+        try
+        {
+            if (!enabled)
+            {
+                if (_ntripService.IsActive) await _ntripService.DisconnectAsync();
+                return;
+            }
+            var field = State.Field.ActiveField?.Name;
+            if (!string.IsNullOrEmpty(field)) await HandleNtripProfileForFieldAsync(field);
+            if (!_ntripService.IsActive) await ConnectDefaultNtripProfileOnStartupAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error switching NTRIP {State}", enabled ? "on" : "off");
+        }
     }
 
     /// <summary>
@@ -151,6 +188,12 @@ public partial class MainViewModel
     /// </summary>
     private async Task ConnectDefaultNtripProfileOnStartupAsync()
     {
+        if (!ConfigStore.Connections.NtripEnabled)
+        {
+            _logger.LogDebug("NTRIP is switched off; skipping startup auto-connect");
+            return;
+        }
+
         var profile = _ntripProfileService.DefaultProfile;
         if (profile == null)
         {
@@ -164,7 +207,7 @@ public partial class MainViewModel
             return;
         }
 
-        if (_ntripService.IsConnected)
+        if (_ntripService.IsActive)
             return;
 
         // Mirror the field-load path: reflect the profile in the display props.
@@ -179,6 +222,38 @@ public partial class MainViewModel
     }
 
     /// <summary>
+    /// After an NTRIP profile is edited: if we're connected with its old caster settings and
+    /// the connection settings changed, reconnect with the new ones (#111).
+    /// </summary>
+    public async Task ReconnectNtripIfConnectedAsync(Models.Ntrip.NtripProfile before, Models.Ntrip.NtripProfile after)
+    {
+        try
+        {
+            if (!_ntripService.IsActive) return;
+            bool wasThisOne = before.CasterHost == NtripCasterAddress
+                && before.CasterPort == NtripCasterPort && before.MountPoint == NtripMountPoint;
+            if (!wasThisOne) return;
+            bool changed = before.CasterHost != after.CasterHost || before.CasterPort != after.CasterPort
+                || before.MountPoint != after.MountPoint || before.Username != after.Username
+                || before.Password != after.Password;
+            if (!changed) return;
+
+            await _ntripService.DisconnectAsync();
+            NtripCasterAddress = after.CasterHost;
+            NtripCasterPort = after.CasterPort;
+            NtripMountPoint = after.MountPoint;
+            NtripUsername = after.Username;
+            NtripPassword = after.Password;
+            _logger.LogInformation("NTRIP profile '{ProfileName}' changed while connected; reconnecting", after.Name);
+            await ConnectToNtripAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error reconnecting NTRIP after a profile change");
+        }
+    }
+
+    /// <summary>
     /// Handles NTRIP profile connection when a field is loaded.
     /// Checks for field-specific profile or falls back to default profile.
     /// </summary>
@@ -186,6 +261,12 @@ public partial class MainViewModel
     {
         try
         {
+            if (!ConfigStore.Connections.NtripEnabled)
+            {
+                _logger.LogDebug("NTRIP is switched off; not connecting for field '{FieldName}'", fieldName);
+                return;
+            }
+
             var profile = _ntripProfileService.GetProfileForField(fieldName);
 
             if (profile == null)
@@ -213,7 +294,7 @@ public partial class MainViewModel
             }
 
             // Disconnect from current caster if connected
-            if (_ntripService.IsConnected)
+            if (_ntripService.IsActive)
             {
                 _logger.LogDebug("Disconnecting from current NTRIP caster");
                 await _ntripService.DisconnectAsync();
@@ -280,6 +361,9 @@ public partial class MainViewModel
     {
         // Update centralized state
         State.Connections.NtripBytesReceived = _ntripService.TotalBytesReceived;
+        var (destination, unicast) = _ntripService.RtcmDestination;
+        State.Connections.NtripRtcmDestination = destination ?? "";
+        State.Connections.NtripRtcmUnicast = unicast;
 
         // Legacy property updates
         _ntripBytesReceived = _ntripService.TotalBytesReceived;

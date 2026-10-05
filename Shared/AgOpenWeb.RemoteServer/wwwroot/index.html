@@ -74,6 +74,7 @@
        (with per-module popup), and big Speed on the right. */
     #statusbar {
       position: fixed; top: var(--sat); left: 0; right: 0; height: 46px; display: none;
+      z-index: 33; /* above #leftnav (32) so the Modules / GPS popups aren't clipped under it (#94) */
       align-items: center; gap: 10px; padding: 0 12px; box-sizing: border-box;
       background: var(--float-bg); border-bottom: 1px solid var(--border-2);
       color: var(--text-2); font: 600 15px system-ui, sans-serif;
@@ -105,7 +106,7 @@
     .sb-rot { color: #3498DB; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sb-spacer { flex: 1; }
     .sb-mods-wrap { position: relative; }
-    #sb-modpop { display: none; position: absolute; top: 36px; right: 0; min-width: 230px;
+    #sb-modpop { display: none; position: absolute; top: 36px; left: 0; min-width: 230px;
       background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
       box-shadow: 0 6px 20px rgba(0,0,0,0.5); z-index: 10; }
     .sb-modrow { display: grid; grid-template-columns: 16px 84px 1fr; align-items: center;
@@ -133,21 +134,21 @@
     #sb-gpscard .gc-row { display: flex; justify-content: space-between; gap: 16px; padding: 1px 0; }
     #sb-gpscard .gc-k { color: var(--text-muted); font-size: 12px; }
     #sb-gpscard .gc-v { color: var(--text-2); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
-    /* Lightbar readout (arrow + cm + line label) — DOM overlay so it renders
-       identically under both the 2D and Skia map renderers (CanvasKit has no
+    /* Lightbar readout (arrow + cm, pass number on a second line) — DOM overlay so it
+       renders identically under both the 2D and Skia map renderers (CanvasKit has no
        bundled font). Sits just below the LED strip. */
     #lb {
       position: fixed; top: calc(74px + var(--sat)); left: 0; right: 0; text-align: center; display: none;
       color: var(--text-2); font: 600 15px system-ui, sans-serif; pointer-events: none;
       text-shadow: 0 1px 2px #000;
     }
-    /* Headland-distance HUD — screen-space box at top-centre (below the light bar),
+    /* Headland-distance HUD — screen-space box at top-centre (below the light bar's two lines),
        mirroring the native SkiaMapControl HUD. Green when clear, red on warning.
        Gated by Display.HeadlandDistanceVisible + a live distance ≥ 0, AND hidden while a
        map-tap creation flow is active (updateHeadlandHud) so it doesn't clutter the top-centre
        instruction pill / draw toolbar. */
     #headland-hud {
-      position: fixed; top: calc(102px + var(--sat)); left: 50%; transform: translateX(-50%); display: none;
+      position: fixed; top: calc(120px + var(--sat)); left: 50%; transform: translateX(-50%); display: none;
       padding: 6px 18px; border-radius: 8px; border: 1px solid rgba(var(--ov),0.25);
       background: rgba(20,46,28,0.85); color: #fff; font: 700 19px ui-monospace, monospace;
       pointer-events: none; z-index: 10; text-shadow: 0 1px 2px #000;
@@ -162,6 +163,15 @@
       pointer-events: none; z-index: 40; box-shadow: 0 2px 10px rgba(0,0,0,0.4);
     }
     #maptap-hint.show { display: block; }
+    /* AutoSteer engaged but the module isn't steering (#126): red, like AgOpenGPS. */
+    #rn-steer.not-steering { background: rgba(220,30,30,0.85); box-shadow: 0 0 0 3px #ff4040; animation: rn-ns 1s ease-in-out infinite alternate; }
+    @keyframes rn-ns { from { box-shadow: 0 0 0 3px #ff4040; } to { box-shadow: 0 0 0 6px rgba(255,64,64,0.35); } }
+    /* Reverse indicator (#125, AgOpenGPS DrawReverse). */
+    #reverse-badge { position: fixed; top: calc(122px + var(--sat)); left: 50%; transform: translateX(-50%);
+      display: none; padding: 6px 18px; border-radius: 999px; border: 1px solid rgba(255,90,90,0.8);
+      background: rgba(70,10,10,0.9); color: #ffd0d0; font: 700 15px system-ui, sans-serif;
+      letter-spacing: 0.05em; pointer-events: none; z-index: 40; }
+    #reverse-badge.show { display: block; }
     /* "Esc to cancel" only on pointer devices with a keyboard; touch cancels via the red
        Cancel button in the draw toolbar (no Esc key on a tablet). */
     @media (pointer: fine) { #maptap-hint::after { content: '  ·  Esc to cancel'; opacity: 0.6; font-weight: 400; } }
@@ -244,7 +254,7 @@
       font: 700 13px system-ui, sans-serif; cursor: pointer; }
     .sim-btn:hover { background: rgba(var(--ov),0.18); }
     .sim-btn:active { background: rgba(70,160,255,0.5); }
-    .sim-stopbtn { background: rgba(231,76,60,0.32); }
+    .sim-stopbtn { background: rgba(231,76,60,0.32); text-transform: uppercase; }
     .sim-closebtn { background: transparent; color: var(--text-muted); min-width: 32px; }
     .sim-toggle { min-width: 42px; height: 40px; border-radius: 6px; border: 1px solid var(--border);
       background: rgba(var(--ov),0.06); color: var(--text-muted); font: 700 12px system-ui, sans-serif;
@@ -288,6 +298,7 @@
     #bottomnav .bn-menu.menuopen { background: var(--sel); }
     #bottomnav .bn-ic { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
     #bn-skipnum { font-size: 22px; font-weight: 700; }
+    #bn-nudgeval { font-size: 14px; font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
     #bottomnav.locked .bn-btn[data-t2] { opacity: 0.45; } /* dim Tier-2 when we lack control */
     .bn-flyout { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
       margin-bottom: 6px; display: none; flex-direction: column; gap: 5px; padding: 8px;
@@ -385,8 +396,10 @@
     .cfg-act { padding: 8px 10px; border: 0; border-radius: 6px; background: rgba(var(--ov),0.10);
       color: var(--text); cursor: pointer; font: 600 12px system-ui, sans-serif; flex: 1; }
     .cfg-act:hover { background: rgba(var(--ov),0.18); }
+    .ln-seg .cfg-act.active, .ln-seg .cfg-act.active:hover { background: #1f6fb2; color: #fff; }
     .cfg-actwide { width: 100%; flex: none; }
     .cfg-slider { width: 100%; accent-color: #4A90D9; }
+    .as-valrow .cfg-actwide { width: auto; flex: 1 1 auto; min-width: 0; }
     /* ===== AutoSteer panel — mirrors native AutoSteerConfigPanel: a title bar, a
        left pane (4 horizontal icon tabs + value cards + Test Mode), a right pane
        (5 icon tabs of cards) revealed in expanded mode, and a Set/Act/Err status
@@ -488,8 +501,23 @@
     .sw-grey { background: rgba(var(--ov),0.12); color: var(--text); }
     .sw-green { background: #2e9e4f; } .sw-blue { background: #2f6fb0; }
     /* ===== Network IO panel + NTRIP modals ===== */
-    .nio-panel { width: 360px; }
-    .nio-modgrid { display: grid; grid-template-columns: auto auto 1fr auto; gap: 7px 8px; align-items: center; margin-bottom: 10px; }
+    .nio-panel { width: 360px; max-height: calc(100vh - 72px - var(--sat)); overflow-y: auto; box-sizing: border-box; }
+    .nio-modgrid { display: grid; grid-template-columns: auto auto 1fr auto auto; gap: 7px 8px; align-items: center; margin-bottom: 10px; }
+    .nio-more { width: 30px; height: 26px; border: 0; border-radius: 6px; background: rgba(var(--ov),0.10); color: var(--text-2);
+      font: 700 18px/1 system-ui, sans-serif; cursor: pointer; padding: 0; }
+    .nio-more:hover { background: rgba(var(--ov),0.18); }
+    /* System Data — chain sub-panel of Network IO (GPS line → arrow). */
+    .nio-sysdata { width: 440px; max-height: calc(100vh - 72px - var(--sat)); overflow-y: auto; box-sizing: border-box; }
+    .sd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 20px; margin-bottom: 12px; }
+    .sd-row { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; }
+    .sd-k { color: var(--text-muted); font: 400 12px system-ui, sans-serif; }
+    .sd-v { color: var(--text-2); font: 700 13px system-ui, sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sd-v.sd-bad { color: #ef4444; }
+    .sd-sent { margin-bottom: 8px; }
+    .sd-senthead { display: flex; justify-content: space-between; color: var(--text-muted); font: 600 11px system-ui, sans-serif; }
+    .sd-senttext { color: var(--text); font: 400 11px ui-monospace, monospace; word-break: break-all; -webkit-user-select: text; user-select: text;
+      background: rgba(var(--ov),0.05); border-radius: 6px; padding: 4px 6px; margin-top: 2px; }
+    .sd-sent.stale .sd-senttext, .sd-sent.stale .sd-senthead { color: var(--text-dim); }
     .nio-chk { width: 18px; height: 18px; accent-color: #4A90D9; margin: 0; }
     .nio-dot { width: 12px; height: 12px; border-radius: 50%; background: #6b7280; }
     .nio-mod { color: var(--text); font: 500 13px system-ui, sans-serif; }
@@ -501,6 +529,17 @@
     .nio-hostips { color: var(--text-2); font: 600 12px ui-monospace, monospace; white-space: pre-line; line-height: 1.5; }
     .nio-rule { border: 0; border-top: 1px solid var(--border); margin: 14px 0 10px; }
     .nio-ntriprow { display: flex; align-items: center; gap: 8px; }
+    .nio-bcrow { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    .nio-warn { color: #ef4444; font: 600 12px system-ui, sans-serif; margin-top: 4px; }
+    .nio-aged { color: #ef4444; }
+    .nio-rtcm { margin-top: 6px; }
+    .nio-rtcm summary { color: var(--text-2); font: 500 12px system-ui, sans-serif; cursor: pointer; }
+    .nio-rtcmscroll { max-height: 30vh; overflow-y: auto; }
+    .nio-rtcmtbl { width: 100%; border-collapse: collapse; margin-top: 4px; font: 400 11px system-ui, sans-serif; color: var(--text); }
+    .nio-rtcmtbl th { text-align: left; color: var(--text-muted); font-weight: 600; padding: 1px 6px 1px 0; }
+    .nio-rtcmtbl td { padding: 1px 6px 1px 0; vertical-align: top; }
+    .nio-rtcmtbl td.num, .nio-rtcmtbl th.num { text-align: right; font-family: ui-monospace, monospace; white-space: nowrap; }
+    .nio-rtcmtbl tr.stale td { color: #ef4444; }
     .nio-ntstatus { color: var(--text-2); font: 500 13px system-ui, sans-serif; }
     /* NTRIP chain sub-panels (ln-panels that replace their parent). */
     .nio-ntmodal { width: 520px; }
@@ -686,6 +725,12 @@
     .wz-live .lbl { color: var(--text-dim); font: 500 12px system-ui, sans-serif; }
     .wz-testbtn { padding: 12px 28px; border: 0; border-radius: 8px; background: #2f6fb0; color: #fff;
       font: 700 15px system-ui, sans-serif; cursor: pointer; }
+    .wz-testbtn.disabled { opacity: 0.4; pointer-events: none; }
+    .wz-circle { min-height: 0; margin: 4px 0 16px; gap: 10px; }
+    .wz-btnrow { display: flex; gap: 12px; }
+    .wz-hint { color: #f59e0b; font: 600 13px system-ui, sans-serif; text-align: center; min-height: 18px; }
+    .wz-phase { margin: 0; text-align: center; }
+    .wz-result { color: var(--text); font: 600 14px system-ui, sans-serif; text-align: center; max-width: 560px; }
     .wz-prereq { border: 1px solid var(--border); border-radius: 10px; background: rgba(var(--ov),0.03); padding: 12px 16px; margin-bottom: 16px; }
     .wz-prereq .ttl { color: var(--text); font: 700 13px system-ui, sans-serif; margin-bottom: 6px; }
     .wz-prereq .it { color: var(--text-2); font: 500 12px system-ui, sans-serif; padding: 2px 0; }
@@ -703,6 +748,31 @@
     .wz-btn { padding: 12px 26px; border: 0; border-radius: 8px; cursor: pointer; color: #fff; font: 700 14px system-ui, sans-serif; }
     .wz-red { background: #b54430; } .wz-grey { background: rgba(var(--ov),0.14); color: var(--text); } .wz-blue { background: #2f6fb0; }
     .wz-btn.disabled { opacity: 0.4; pointer-events: none; }
+    /* Fit the wizard without vertical scrolling on smaller / high-DPI-scaled screens
+       (#154: a 2736x1716 laptop at 225% gives ~1216x735 CSS px). Fields and toggle rows
+       go two-up when there's width; spacing tightens when height is short. */
+    @media (min-width: 860px) {
+      .wz-rows { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; align-items: start; }
+      .wz-rows > .wz-fld { margin-top: 0; }
+      /* Circle tests: prerequisites and the live steer angle share a row. */
+      .wz-testtop { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: center; }
+      .wz-testtop > .wz-prereq { margin-bottom: 0; }
+      .wz-testtop > .wz-live { margin: 0 24px 0 0; }
+    }
+    @media (max-height: 820px) {
+      .wz-header { padding: 10px 22px; } .wz-step { top: 12px; }
+      .wz-body { padding: 12px 22px; }
+      .wz-h1 { font-size: 20px; margin-bottom: 4px; }
+      .wz-desc { margin-bottom: 10px; line-height: 1.4; }
+      .wz-center { min-height: 140px; gap: 10px; }
+      .wz-cards { margin: 12px auto; }
+      .wz-panel { padding: 12px; } .wz-panel img.dia { height: 150px; }
+      .wz-live { margin: 6px 0; } .wz-live .big { font-size: 34px; }
+      .wz-prereq { padding: 8px 14px; margin-bottom: 10px; }
+      .wz-fld { margin-top: 8px; } .wz-num { height: 36px; }
+      .wz-statusbar { padding: 6px; }
+      .wz-footer { padding: 8px 22px; } .wz-btn { padding: 9px 22px; }
+    }
     /* Vehicle config diagrams (type cards + per-field measurement diagrams). */
     .vc-typecards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 12px; }
     .vc-typecard { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px;
@@ -800,6 +870,49 @@
       font: 700 14px system-ui, sans-serif; }
     .dlg-cancel { background: rgba(var(--ov),0.10); color: var(--text-2); }
     .dlg-ok { background: #1f6fb2; color: #fff; }
+    #dp-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; max-height: 50vh; overflow-y: auto; }
+    .dp-row { display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: center; min-height: 44px;
+      padding: 0 12px; border-radius: 8px; border: 1px solid var(--border); cursor: pointer; }
+    .dp-row:active { background: rgba(74,144,217,0.25); }
+    .dp-name { color: var(--text); font: 600 15px system-ui, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dp-num { color: var(--text-muted); font: 500 13px system-ui, sans-serif; text-align: right; }
+    /* Host prompt (#109): the host's own confirm/error, which must be answered — dimmed
+       backdrop with no tap-outside dismiss, above every other dialog. */
+    #hostprompt { position: fixed; inset: 0; display: none; align-items: flex-start;
+      justify-content: center; z-index: 60; background: rgba(0,0,0,0.45); }
+    #hostprompt.open { display: flex; }
+    #hostprompt .dlg-card { display: flex; }
+    #hp-msg { white-space: pre-line; }
+    #hp-check { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+      color: var(--text-2); font: 500 14px system-ui, sans-serif; }
+    #hp-check[hidden] { display: none; }
+    #hp-check input { width: 20px; height: 20px; }
+    #hp-wait { color: var(--text-muted); font: 500 13px system-ui, sans-serif; text-align: center; margin-top: 10px; }
+    .dlg-btn:disabled { opacity: 0.4; cursor: default; }
+    /* Failure notification (#109): a refused/failed action says why. */
+    #toast { position: fixed; bottom: calc(90px + var(--sab, 0px)); left: 50%; transform: translateX(-50%);
+      max-width: min(560px, calc(100vw - 32px)); display: none; padding: 10px 20px; border-radius: 10px;
+      border: 1px solid rgba(255,190,90,0.7); background: rgba(58,38,8,0.94); color: #ffe2b0;
+      font: 600 15px system-ui, sans-serif; text-align: center; pointer-events: none; z-index: 70;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+    #toast.show { display: block; }
+    #hwmsg { position: fixed; top: calc(96px + var(--sat, 0px)); left: 50%; transform: translateX(-50%);
+      max-width: min(560px, calc(100vw - 32px)); display: none; padding: 8px 18px; border-radius: 8px;
+      color: #000; font: 700 16px system-ui, sans-serif; text-align: center; pointer-events: none; z-index: 70;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+    #hwmsg.show { display: block; }
+    /* On-screen keyboard (App Settings › On-screen Kbd, AgOpenGPS FormKeyboard/FormNumeric) (#110). */
+    #osk { position: fixed; left: 0; right: 0; bottom: 0; z-index: 90; padding: 8px 8px calc(8px + var(--sab, 0px));
+      background: rgba(14,18,28,0.97); border-top: 1px solid var(--border, #334); box-shadow: 0 -4px 16px rgba(0,0,0,0.5);
+      display: flex; flex-direction: column; gap: 6px; align-items: center; touch-action: manipulation; user-select: none; }
+    #osk[hidden] { display: none; }
+    #osk .osk-row { display: flex; gap: 6px; justify-content: center; width: 100%; max-width: 900px; }
+    #osk button { flex: 1 1 0; min-width: 0; height: 52px; border-radius: 8px; border: 1px solid #3a4560;
+      background: #222b3d; color: #eef; font: 600 20px system-ui, sans-serif; }
+    #osk button:active { background: #34405a; }
+    #osk button.wide { flex-grow: 2; } #osk button.xwide { flex-grow: 5; }
+    #osk button.ok { background: #1f6f3a; border-color: #2e9a53; }
+    #osk.num .osk-row { max-width: 360px; }
     /* AB creation selectors (Quick AB / Draw AB) — mode-button grid. */
     .dlg-wide { max-width: 460px; min-width: 420px; }
     .dlg-sub { color: var(--text-muted); font: 700 13px system-ui, sans-serif; text-align: center; margin: 12px 0 6px; }
@@ -829,6 +942,7 @@
       padding: 9px 10px; border-bottom: 1px solid rgba(var(--ov),0.05); cursor: pointer; }
     .trk-row:hover { background: rgba(var(--ov),0.05); }
     .trk-row.active { background: rgba(39,174,96,0.18); }
+    .trk-row.sel { box-shadow: inset 0 0 0 2px #4A90D9; }
     .trk-row .trk-name { color: var(--text); font: 500 14px system-ui, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .trk-row .trk-type { text-align: center; color: var(--text-muted); font: 500 13px system-ui, sans-serif; }
     .trk-row .trk-dot { justify-self: center; width: 14px; height: 14px; border-radius: 50%; background: var(--dot-off); }
@@ -1094,6 +1208,7 @@
         <div class="gc-row"><span class="gc-k">HDOP:</span><span class="gc-v" id="gc-hdop">—</span></div>
         <div class="gc-row"><span class="gc-k">Fix:</span><span class="gc-v" id="gc-fix">—</span></div>
         <div class="gc-row"><span class="gc-k">Age:</span><span class="gc-v" id="gc-age">—</span></div>
+        <div class="gc-row"><span class="gc-k">Sentence:</span><span class="gc-v" id="gc-sentence">—</span></div>
         <div class="gc-rule"></div>
         <div class="gc-row"><span class="gc-k">Heading:</span><span class="gc-v" id="gc-hdg">—</span></div>
         <div class="gc-row"><span class="gc-k">IMU Roll:</span><span class="gc-v" id="gc-roll">—</span></div>
@@ -1114,6 +1229,7 @@
   <div id="lb"></div>
   <div id="headland-hud"></div>
   <div id="maptap-hint"></div>
+  <div id="reverse-badge" title="Reversing">&#9664; REVERSE</div>
   <button id="maptap-cancel">✕ Cancel</button>
   <div id="maptap-ab">A</div>
   <div id="ab-dot-labels"></div>
@@ -1219,7 +1335,7 @@
       <button class="sa-tgl" data-key="display.hardwareMessagesEnabled">AiO Board Msgs</button>
       <button class="sa-act" data-cmd="display.toggleTheme">Day/Night Theme</button>
       <button class="sa-tgl" data-key="display.extraGuidelines"><img class="sa-ic" src="/icons/ConD_ExtraGuides.png" alt="">Extra Guides</button>
-      <input id="sa-extracount" class="cfg-num" type="number" step="1" min="0" title="Extra guide count">
+      <input id="sa-extracount" class="cfg-num" type="number" step="1" min="1" max="50" title="Extra guide count">
       <button class="sa-act" data-cmd="display.cycleResolution">Quality: <span id="sa-quality">—</span></button>
     </div>
     <div class="cfg-label">On-Screen Buttons</div>
@@ -1299,16 +1415,16 @@
             <img id="vc-img-hitch" class="vc-diag" alt="">
             <div class="vc-fieldcol">
               <label>Coupling type</label><select class="cfg-sel" data-key="vehicle.hitchType"></select>
-              <label>Hitch length (m)</label><input class="cfg-num" data-key="vehicle.hitchLength" type="number" step="0.01" inputmode="decimal">
+              <label>Hitch length (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.hitchLength" type="number" step="0.01" inputmode="decimal">
             </div>
           </div>
           <div class="vc-diagrow">
             <img id="vc-img-wheelbase" class="vc-diag" alt="">
-            <div class="vc-fieldcol"><label>Wheelbase (m)</label><input class="cfg-num" data-key="vehicle.wheelbase" type="number" step="0.01" inputmode="decimal"></div>
+            <div class="vc-fieldcol"><label>Wheelbase (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.wheelbase" type="number" step="0.01" inputmode="decimal"></div>
           </div>
           <div class="vc-diagrow">
             <img id="vc-img-track" class="vc-diag" alt="">
-            <div class="vc-fieldcol"><label>Track width (m)</label><input class="cfg-num" data-key="vehicle.trackWidth" type="number" step="0.01" inputmode="decimal"></div>
+            <div class="vc-fieldcol"><label>Track width (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.trackWidth" type="number" step="0.01" inputmode="decimal"></div>
           </div>
         </div>
         <div>
@@ -1316,14 +1432,14 @@
           <div class="vc-diagrow">
             <img id="vc-img-antside" class="vc-diag" alt="">
             <div class="vc-fieldcol">
-              <label>Antenna pivot (m)</label><input class="cfg-num" data-key="vehicle.antennaPivot" type="number" step="0.01" inputmode="decimal">
-              <label>Antenna height (m)</label><input class="cfg-num" data-key="vehicle.antennaHeight" type="number" step="0.01" inputmode="decimal">
+              <label>Antenna pivot (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.antennaPivot" type="number" step="0.01" inputmode="decimal">
+              <label>Antenna height (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.antennaHeight" type="number" step="0.01" inputmode="decimal">
             </div>
           </div>
           <div class="vc-diagrow">
             <img id="vc-img-antoffset" class="vc-diag" alt="">
             <div class="vc-fieldcol">
-              <label>Antenna offset (m)</label><input class="cfg-num" data-key="vehicle.antennaOffset" type="number" step="0.01" inputmode="decimal">
+              <label>Antenna offset (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="vehicle.antennaOffset" type="number" step="0.01" inputmode="decimal">
               <div class="ln-seg">
                 <button class="cfg-act" data-key="vehicle.antennaSide" data-val="left">Left</button>
                 <button class="cfg-act" data-key="vehicle.antennaSide" data-val="center">Center</button>
@@ -1341,19 +1457,19 @@
           <div class="cfg-grid">
             <label>Dual GPS</label><button class="cfg-tgl" data-key="gps.isDualGps">Off</button>
             <label>Heading offset (°)</label><input class="cfg-num" data-key="gps.dualHeadingOffset" type="number" step="0.1" inputmode="decimal">
-            <label>Reverse dist (m)</label><input class="cfg-num" data-key="gps.dualReverseDistance" type="number" step="0.1" inputmode="decimal">
+            <label>Reverse dist (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="gps.dualReverseDistance" type="number" step="0.1" inputmode="decimal">
             <label>Auto dual fix</label><button class="cfg-tgl" data-key="gps.autoDualFix">Off</button>
-            <label>Switch speed</label><input class="cfg-num" data-key="gps.dualSwitchSpeed" type="number" step="0.1" inputmode="decimal">
+            <label>Switch speed (<span class="u" data-unit="kmh"></span>)</label><input class="cfg-num" data-unit="kmh" data-key="gps.dualSwitchSpeed" type="number" step="0.1" inputmode="decimal">
           </div>
         </div>
         <div>
           <div class="cfg-label">Single antenna</div>
           <div class="cfg-grid">
-            <label>Min GPS step (m)</label><input class="cfg-num" data-key="gps.minGpsStep" type="number" step="0.01" inputmode="decimal">
-            <label>Fix-to-fix dist (m)</label><input class="cfg-num" data-key="gps.fixToFixDistance" type="number" step="0.01" inputmode="decimal">
+            <label>Min GPS step (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="gps.minGpsStep" type="number" step="0.01" inputmode="decimal">
+            <label>Fix-to-fix dist (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="gps.fixToFixDistance" type="number" step="0.01" inputmode="decimal">
             <label>Reverse detection</label><button class="cfg-tgl" data-key="gps.reverseDetection">Off</button>
           </div>
-          <div class="cfg-grid" style="margin-top:6px"><label>Heading fusion <span id="vc-hfw">—</span></label><input class="cfg-slider" data-key="gps.headingFusionWeight" type="range" min="0" max="1" step="0.05"></div>
+          <div class="cfg-grid" style="margin-top:6px"><label>Heading fusion <span id="vc-hfw">—</span></label><input class="cfg-slider" data-key="gps.headingFusionWeight" type="range" min="0" max="1" step="0.01" title="How fast GPS corrects the IMU heading"></div>
           <div class="cfg-label" style="margin-top:8px">RTK</div>
           <div class="cfg-grid">
             <label>RTK lost alarm</label><button class="cfg-tgl" data-key="gps.rtkLostAlarm">Off</button>
@@ -1366,7 +1482,8 @@
       <img src="/icons/ConD_RollHelper.png" class="vc-diag-wide" alt="Roll calibration">
       <div class="cfg-grid">
         <label>Roll zero (°)</label><input class="cfg-num" data-key="roll.rollZero" type="number" step="0.01" inputmode="decimal">
-        <label></label><button class="cfg-act cfg-actwide" data-key="roll.setZero" data-val="1">Zero Now</button>
+        <label></label><button id="vc-rollzero" class="cfg-act cfg-actwide" title="Take the current roll as zero (AgOpenGPS Zero Roll)">Zero Now</button>
+        <label></label><button class="cfg-act cfg-actwide" data-key="roll.setZero" data-val="1" title="Set the roll offset back to 0">Remove Offset</button>
         <label>Roll filter</label><input class="cfg-num" data-key="roll.rollFilter" type="number" step="0.01" inputmode="decimal">
         <label>Invert roll</label><button class="cfg-tgl" data-key="roll.isRollInvert">Off</button>
       </div>
@@ -1410,10 +1527,10 @@
           <img id="tc-img-hitch" class="vc-diag" alt="">
           <div class="vc-fieldcol">
             <label>Coupling type</label><select class="cfg-sel" data-key="tool.hitchType"></select>
-            <label data-show="rigid">Working center (m)</label><input class="cfg-num" data-key="tool.hitchLength" data-show="rigid" type="number" step="0.01">
-            <label data-show="trailtbt">Trailing hitch (m)</label><input class="cfg-num" data-key="tool.trailingHitchLength" data-show="trailtbt" type="number" step="0.01">
-            <label data-show="tbt">Tank trailing hitch (m)</label><input class="cfg-num" data-key="tool.tankTrailingHitchLength" data-show="tbt" type="number" step="0.01">
-            <label>Implement length (m)</label><input class="cfg-num" data-key="tool.length" type="number" step="0.01">
+            <label data-show="rigid">Working center (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.hitchLength" data-show="rigid" type="number" step="0.01">
+            <label data-show="trailtbt">Trailing hitch (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.trailingHitchLength" data-show="trailtbt" type="number" step="0.01">
+            <label data-show="tbt">Tank trailing hitch (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.tankTrailingHitchLength" data-show="tbt" type="number" step="0.01">
+            <label>Implement length (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.length" type="number" step="0.01">
           </div>
         </div>
       </div>
@@ -1426,17 +1543,17 @@
       </div>
       <div id="tcs-offset" class="cfg-body" data-strip="tc-sub" hidden>
         <div class="vc-diagrow"><img src="/icons/ToolOffsetPositiveRight.png" class="vc-diag" alt=""><div class="vc-fieldcol">
-          <label>Tool offset (m)</label><input class="cfg-num" data-key="tool.offset" type="number" step="0.01">
+          <label>Tool offset (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.offset" type="number" step="0.01">
           <label>Direction</label><div class="ln-seg"><button class="cfg-act" data-key="tool.offsetSide" data-val="left">Left</button><button class="cfg-act" data-key="tool.offsetSide" data-val="center">Zero</button><button class="cfg-act" data-key="tool.offsetSide" data-val="right">Right</button></div>
         </div></div>
         <div class="vc-diagrow"><img src="/icons/ToolOverlap.png" class="vc-diag" alt=""><div class="vc-fieldcol">
-          <label>Overlap / gap (m)</label><input class="cfg-num" data-key="tool.overlap" type="number" step="0.01">
+          <label>Overlap / gap (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.overlap" type="number" step="0.01">
           <label>Mode</label><div class="ln-seg"><button class="cfg-act" data-key="tool.overlapSide" data-val="overlap">Overlap</button><button class="cfg-act" data-key="tool.overlapSide" data-val="zero">Zero</button><button class="cfg-act" data-key="tool.overlapSide" data-val="gap">Gap</button></div>
         </div></div>
       </div>
       <div id="tcs-pivot" class="cfg-body" data-strip="tc-sub" hidden>
         <div class="vc-diagrow"><img src="/icons/ToolHitchPivotOffsetPos.png" class="vc-diag" alt=""><div class="vc-fieldcol">
-          <label>Pivot distance (m)</label><input class="cfg-num" data-key="tool.trailingToolToPivotLength" type="number" step="0.01">
+          <label>Pivot distance (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tool.trailingToolToPivotLength" type="number" step="0.01">
           <label>Direction</label><div class="ln-seg"><button class="cfg-act" data-key="tool.pivotSide" data-val="behind">Behind</button><button class="cfg-act" data-key="tool.pivotSide" data-val="zero">Zero</button><button class="cfg-act" data-key="tool.pivotSide" data-val="ahead">Ahead</button></div>
         </div></div>
         <div class="cfg-note" data-show="notrailtbt">Pivot settings apply only to Trailing and TBT tools.</div>
@@ -1451,10 +1568,10 @@
             </div>
             <div class="cfg-grid">
               <label>Number of sections</label><input class="cfg-num" data-key="tool.numSections" type="number" step="1" min="1" max="64">
-              <label>Default width (cm)</label><input class="cfg-num" data-key="tool.defaultSectionWidth" type="number" step="1">
+              <label>Default width (<span class="u" data-unit="cm"></span>)</label><input class="cfg-num" data-unit="cm" data-key="tool.defaultSectionWidth" type="number" step="0.1">
             </div>
             <div data-show="individual">
-              <div class="cfg-label">Section widths (cm)</div>
+              <div class="cfg-label">Section widths (<span class="u" data-unit="cm"></span>)</div>
               <div id="tc-sectionwidths" class="tc-dyngrid"></div>
             </div>
             <div data-show="zones">
@@ -1475,8 +1592,8 @@
               <label>Off outside boundary</label><button class="cfg-tgl" data-key="tool.isSectionOffWhenOut">Off</button>
               <label>Off in headland</label><button class="cfg-tgl" data-key="tool.isHeadlandSectionControl">Off</button>
               <label>Min coverage (%)</label><input class="cfg-num" data-key="tool.minCoverage" type="number" step="1">
-              <label>Slow speed cutoff (km/h)</label><input class="cfg-num" data-key="tool.slowSpeedCutoff" type="number" step="0.1">
-              <label>Coverage margin (cm)</label><input class="cfg-num" data-key="tool.coverageMargin" type="number" step="1">
+              <label>Slow speed cutoff (<span class="u" data-unit="kmh"></span>)</label><input class="cfg-num" data-unit="kmh" data-key="tool.slowSpeedCutoff" type="number" step="0.1">
+              <label>Coverage margin (<span class="u" data-unit="cm"></span>)</label><input class="cfg-num" data-unit="cm" data-key="tool.coverageMargin" type="number" step="1">
             </div>
           </div>
         </div>
@@ -1507,10 +1624,10 @@
         <button class="cfg-typebtn" data-key="uturn.style" data-val="1">K-turn</button>
       </div>
       <div class="cfg-diaggrid">
-        <div class="vc-diagrow"><img src="/icons/ConU_UturnLength.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Extension (m)</label><input class="cfg-num" data-key="uturn.extension" type="number" step="0.1"></div></div>
+        <div class="vc-diagrow"><img src="/icons/ConU_UturnLength.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Extension (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="uturn.extension" type="number" step="0.1"></div></div>
         <div class="vc-diagrow"><img src="/icons/ConU_UturnSmooth.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Smoothing</label><input class="cfg-num" data-key="uturn.smoothing" type="number" step="1"></div></div>
-        <div class="vc-diagrow"><img src="/icons/ConU_UturnRadius.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Radius (m)</label><input class="cfg-num" data-key="uturn.radius" type="number" step="0.1"></div></div>
-        <div class="vc-diagrow"><img src="/icons/ConU_UturnDistance.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Distance from bndry (m)</label><input class="cfg-num" data-key="uturn.distanceFromBoundary" type="number" step="0.1"></div></div>
+        <div class="vc-diagrow"><img src="/icons/ConU_UturnRadius.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Radius (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="uturn.radius" type="number" step="0.1"></div></div>
+        <div class="vc-diagrow"><img src="/icons/ConU_UturnDistance.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Distance from boundary (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="uturn.distanceFromBoundary" type="number" step="0.1"></div></div>
       </div>
     </div>
     <!-- ===== MACHINE ===== -->
@@ -1552,7 +1669,8 @@
     <div id="tc-tram" class="cfg-body" data-strip="tc-top" hidden>
       <div class="vc-diagrow"><img src="/icons/ConT_TramOverride.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Passes</label><input class="cfg-num" data-key="tram.passes" type="number" step="1"></div></div>
       <div class="cfg-grid"><label>Display</label><button class="cfg-tgl" data-key="tram.display">Off</button></div>
-      <div class="vc-diagrow"><img src="/icons/ConT_TramSpacing.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Tram line</label><input class="cfg-num" data-key="tram.line" type="number" step="1"></div></div>
+      <div class="vc-diagrow"><img src="/icons/ConT_TramSpacing.png" class="vc-diag" alt=""><div class="vc-fieldcol"><label>Tram width (<span class="u" data-unit="m"></span>)</label><input class="cfg-num" data-unit="m" data-key="tram.width" type="number" step="0.1" min="1"></div></div>
+      <div class="cfg-grid"><label>First tram pass</label><input class="cfg-num" data-key="tram.line" type="number" step="1" min="1" title="Pass the tram lines start on (AgOpenGPS start pass + 1)"></div>
     </div>
     <button id="tc-save" class="ln-savebtn">Save Profile</button>
   </div>
@@ -1615,7 +1733,7 @@
           <div class="as-caphdr">Look-ahead Speed Factor</div>
           <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.speedFactor" data-fmt="f1">—</span><input class="cfg-slider" data-key="autosteer.speedFactor" data-fmt="f1" type="range" min="0.5" max="3" step="0.1"></div>
           <div class="as-caphdr">Acquire Factor</div>
-          <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.acquireFactor" data-fmt="f2">—</span><input class="cfg-slider" data-key="autosteer.acquireFactor" data-fmt="f2" type="range" min="0.5" max="1" step="0.01"></div>
+          <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.acquireFactor" data-fmt="f2">—</span><input class="cfg-slider" data-key="autosteer.acquireFactor" data-fmt="f2" type="range" min="0.2" max="3" step="0.01"></div>
         </div>
 
         <!-- Tab 4: Gain / PWM -->
@@ -1677,10 +1795,10 @@
           <div class="as-card as-togcard"><img src="/icons/ConSt_InvertDirection.png" alt=""><label>Invert motor</label><button class="cfg-tgl" data-key="autosteer.invertMotor">Off</button></div>
           <div class="as-card as-togcard"><img src="/icons/ConSt_InvertRelay.png" alt=""><label>Invert relays</label><button class="cfg-tgl" data-key="autosteer.invertRelays">Off</button></div>
           <div class="as-card"><div class="cfg-grid">
-            <label>Motor driver</label><select class="cfg-isel" data-key="autosteer.motorDriver"><option value="0">IBT2</option><option value="1">Cytron</option></select>
+            <label>Motor driver</label><select class="cfg-isel" data-key="autosteer.motorDriver"><option value="0" translate="no">IBT2</option><option value="1" translate="no">Cytron</option></select>
             <label>A/D converter</label><select class="cfg-isel" data-key="autosteer.adConverter"><option value="0">Differential</option><option value="1">Single</option></select>
             <label>IMU axis</label><select class="cfg-isel" data-key="autosteer.imuAxisSwap"><option value="0">X</option><option value="1">Y</option></select>
-            <label>External enable</label><select class="cfg-isel" data-key="autosteer.externalEnable"><option value="0">None</option><option value="1">Switch</option><option value="2">Button</option></select>
+            <label title="A switch or button wired to the steer module. When set, it engages and disengages AutoSteer (and a module kickout disengages it).">Steer switch / button (engages AutoSteer)</label><select class="cfg-isel" data-key="autosteer.externalEnable"><option value="0">None</option><option value="1">Switch</option><option value="2">Button</option></select>
           </div></div>
         </div>
 
@@ -1688,7 +1806,7 @@
         <div id="as-algo" class="cfg-body" data-strip="as-right" hidden>
           <div class="as-card as-togcard"><label>Algorithm</label><button id="as-modeswitch" class="as-modesw">Pure Pursuit</button></div>
           <div class="as-caphdr">U-Turn Compensation <span class="as-hint">(− out / + in)</span></div>
-          <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.uTurnCompensation" data-fmt="f0">—</span><input class="cfg-slider" data-key="autosteer.uTurnCompensation" data-fmt="f0" type="range" min="-100" max="100" step="1"></div>
+          <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.uTurnCompensation" data-fmt="f0">—</span><input class="cfg-slider" data-key="autosteer.uTurnCompensation" data-fmt="f0" type="range" min="-80" max="100" step="1"></div>
           <div class="as-caphdr">Side-hill Compensation</div>
           <div class="as-valrow"><span class="as-valbox cfg-ro" data-for="autosteer.sideHillCompensation" data-fmt="f2">—</span><input class="cfg-slider" data-key="autosteer.sideHillCompensation" data-fmt="f2" type="range" min="0" max="1" step="0.01"></div>
           <div class="as-card as-togcard"><img src="/icons/ConSt_InvertDirection.png" alt=""><label>Steer in reverse</label><button class="cfg-tgl" data-key="autosteer.steerInReverse">Off</button></div>
@@ -1698,9 +1816,9 @@
         <div id="as-speed" class="cfg-body" data-strip="as-right" hidden>
           <div class="as-card as-togcard"><img src="/icons/con_VehicleFunctionSpeedLimit.png" alt=""><label>Manual turns</label><button class="cfg-tgl" data-key="autosteer.manualTurnsEnabled">Off</button></div>
           <div class="as-card"><div class="cfg-grid">
-            <label>Manual turns speed (km/h)</label><input class="cfg-num" data-key="autosteer.manualTurnsSpeed" type="number" step="0.1">
-            <label>Min steer speed (km/h)</label><input class="cfg-num" data-key="autosteer.minSteerSpeed" type="number" step="0.1">
-            <label>Max steer speed (km/h)</label><input class="cfg-num" data-key="autosteer.maxSteerSpeed" type="number" step="0.1">
+            <label>Manual turns speed (<span class="u" data-unit="kmh"></span>)</label><input class="cfg-num" data-unit="kmh" data-key="autosteer.manualTurnsSpeed" type="number" step="0.1" min="0" max="20">
+            <label>Min steer speed (<span class="u" data-unit="kmh"></span>)</label><input class="cfg-num" data-unit="kmh" data-key="autosteer.minSteerSpeed" type="number" step="0.1" min="0" max="10">
+            <label>Max steer speed (<span class="u" data-unit="kmh"></span>)</label><input class="cfg-num" data-unit="kmh" data-key="autosteer.maxSteerSpeed" type="number" step="0.1" min="0" max="50">
           </div></div>
         </div>
 
@@ -1709,7 +1827,7 @@
           <div class="as-caphdr">Line Width (px)</div>
           <div class="as-valrow"><img class="as-dia" src="/icons/ConV_LineWith.png" alt=""><span class="as-valbox cfg-ro" data-for="autosteer.lineWidth" data-fmt="f0">—</span><input class="cfg-slider" data-key="autosteer.lineWidth" data-fmt="f0" type="range" min="1" max="8" step="1"></div>
           <div class="as-card"><div class="cfg-grid">
-            <label>Nudge distance (cm)</label><input class="cfg-num" data-key="autosteer.nudgeDistance" type="number" step="1">
+            <label>Nudge distance (<span class="u" data-unit="cm"></span>)</label><input class="cfg-num" data-unit="cm" data-key="autosteer.nudgeDistance" type="number" step="1">
             <label>Next guidance (s)</label><input class="cfg-num" data-key="autosteer.nextGuidanceTime" type="number" step="0.1">
             <label>cm per pixel</label><input class="cfg-num" data-key="autosteer.cmPerPixel" type="number" step="1">
           </div></div>
@@ -1753,12 +1871,13 @@
     <div class="nio-modgrid">
       <input type="checkbox" class="nio-chk" id="nio-gps-cfg" data-key="conn.gpsConfigured" title="GPS module should be present">
       <span class="nio-dot" id="nio-gps-dot"></span><span class="nio-mod">GPS</span><span class="nio-ip" id="nio-gps-ip">—</span>
+      <button class="nio-more" id="nio-gps-more" title="System Data">›</button>
       <input type="checkbox" class="nio-chk" id="nio-as-cfg" data-key="conn.autoSteerConfigured" title="AutoSteer module should be present">
-      <span class="nio-dot" id="nio-as-dot"></span><span class="nio-mod">AutoSteer</span><span class="nio-ip" id="nio-as-ip">—</span>
+      <span class="nio-dot" id="nio-as-dot"></span><span class="nio-mod">AutoSteer</span><span class="nio-ip" id="nio-as-ip">—</span><span></span>
       <input type="checkbox" class="nio-chk" id="nio-ma-cfg" data-key="conn.machineConfigured" title="Machine module should be present">
-      <span class="nio-dot" id="nio-ma-dot"></span><span class="nio-mod">Machine</span><span class="nio-ip" id="nio-ma-ip">—</span>
+      <span class="nio-dot" id="nio-ma-dot"></span><span class="nio-mod">Machine</span><span class="nio-ip" id="nio-ma-ip">—</span><span></span>
       <input type="checkbox" class="nio-chk" id="nio-imu-cfg" data-key="conn.imuConfigured" title="IMU module should be present">
-      <span class="nio-dot" id="nio-imu-dot"></span><span class="nio-mod">IMU</span><span class="nio-ip" id="nio-imu-ip">—</span>
+      <span class="nio-dot" id="nio-imu-dot"></span><span class="nio-mod">IMU</span><span class="nio-ip" id="nio-imu-ip">—</span><span></span>
     </div>
     <button id="nio-scan" class="cfg-act cfg-actwide">Scan for Modules</button>
     <div class="cfg-label" style="margin-top:14px">Subnet</div>
@@ -1780,8 +1899,68 @@
       <span class="nio-mod" style="font-weight:700">NTRIP</span>
       <span class="nio-ntstatus" id="nio-ntrip-status">Not Connected</span>
     </div>
-    <div class="sa-hint" id="nio-ntrip-bytes">0 KB</div>
+    <div class="sa-hint" id="nio-ntrip-bytes" translate="no">0 KB</div>
+    <div class="sa-hint" id="nio-ntrip-dest"></div>
+    <div class="sa-hint" id="nio-ntrip-rx"></div>
+    <div class="nio-warn" id="nio-ntrip-warn" hidden></div>
+    <details class="nio-rtcm" id="nio-rtcm" hidden>
+      <summary id="nio-rtcm-sum"></summary>
+      <div class="nio-rtcmscroll">
+        <table class="nio-rtcmtbl">
+          <thead><tr><th>Type</th><th>Message</th><th class="num">Every</th><th class="num">Last</th></tr></thead>
+          <tbody id="nio-rtcm-rows"></tbody>
+        </table>
+      </div>
+    </details>
+    <label class="nio-bcrow" title="Send corrections to every device on the module subnet, not only to the GPS module">
+      <input type="checkbox" class="nio-chk" id="nio-rtcm-bc" data-key="conn.rtcmBroadcast">
+      <span class="nio-mod">Broadcast corrections</span>
+    </label>
+    <label class="nio-bcrow" title="Off: no connection to the NTRIP caster, for work without mobile coverage">
+      <input type="checkbox" class="nio-chk" id="nio-ntrip-on" data-key="conn.ntripEnabled" checked>
+      <span class="nio-mod">NTRIP on</span>
+    </label>
     <button id="nio-ntprofiles" class="cfg-act cfg-actwide" style="margin-top:8px">NTRIP Profiles</button>
+  </div>
+  <!-- System Data — chain sub-panel of Network IO, opened from the GPS line's arrow. The
+       AgIO / AgOpenGPS "System Data" forms in one card: parsed values, each heading source
+       before fusion, and the module's latest raw sentences. Back reopens Network IO. -->
+  <div id="systemdata" class="ln-panel nio-sysdata">
+    <div class="ln-hdr"><button class="ln-x" id="sd-back" title="Back">←</button><span class="ln-hdr-title">System Data</span><button class="ln-x" id="sd-x" title="Close">✕</button></div>
+    <div class="cfg-label">Position</div>
+    <div class="sd-grid">
+      <div class="sd-row"><span class="sd-k">Latitude</span><span class="sd-v" id="sd-lat" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Longitude</span><span class="sd-v" id="sd-lon" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Easting</span><span class="sd-v" id="sd-e" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Northing</span><span class="sd-v" id="sd-n" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Altitude</span><span class="sd-v" id="sd-alt" translate="no">—</span></div>
+    </div>
+    <div class="cfg-label">Quality</div>
+    <div class="sd-grid">
+      <div class="sd-row"><span class="sd-k">Fix</span><span class="sd-v" id="sd-fix">—</span></div>
+      <div class="sd-row"><span class="sd-k">Satellites</span><span class="sd-v" id="sd-sats" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">HDOP</span><span class="sd-v" id="sd-hdop" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Correction age</span><span class="sd-v" id="sd-age" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">GPS rate</span><span class="sd-v" id="sd-hz" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Missed sentences</span><span class="sd-v" id="sd-missed" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Not accepted</span><span class="sd-v" id="sd-rej" translate="no">—</span></div>
+    </div>
+    <div class="cfg-label">Motion</div>
+    <div class="sd-grid">
+      <div class="sd-row"><span class="sd-k">Speed</span><span class="sd-v" id="sd-speed" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Roll</span><span class="sd-v" id="sd-roll" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Pitch</span><span class="sd-v" id="sd-pitch" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Yaw rate</span><span class="sd-v" id="sd-yaw" translate="no">—</span></div>
+    </div>
+    <div class="cfg-label">Heading</div>
+    <div class="sd-grid">
+      <div class="sd-row"><span class="sd-k">Dual antenna</span><span class="sd-v" id="sd-hdual" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">IMU</span><span class="sd-v" id="sd-himu" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">Fix to fix</span><span class="sd-v" id="sd-hf2f" translate="no">—</span></div>
+      <div class="sd-row"><span class="sd-k">In use</span><span class="sd-v" id="sd-hused" translate="no">—</span></div>
+    </div>
+    <div class="cfg-label">Sentences from the GPS module</div>
+    <div id="sd-sentences"></div>
   </div>
   <!-- NTRIP Profiles — chain sub-panel of Network IO. Per the native chain model
        (MainViewModel.Navigation.Chain): opening REPLACES the parent (single panel
@@ -1807,7 +1986,7 @@
       <div class="nio-fld"><label>Host</label><input class="cfg-num nio-tx" id="nte-host" placeholder="e.g., rtk2go.com"></div>
       <div class="nio-row2">
         <div class="nio-fld"><label>Port</label><input class="cfg-num nio-tx" id="nte-port" type="number" placeholder="2101"></div>
-        <div class="nio-fld"><label>Mount</label><input class="cfg-num nio-tx" id="nte-mount" placeholder="NEAR-RTCM3"></div>
+        <div class="nio-fld"><label>Mount</label><input class="cfg-num nio-tx" id="nte-mount" placeholder="NEAR-RTCM3" translate="no"></div>
       </div>
       <div class="nio-row2">
         <div class="nio-fld"><label>User</label><input class="cfg-num nio-tx" id="nte-user" placeholder="(optional)"></div>
@@ -1851,7 +2030,7 @@
     <div class="fj-cols">
       <div class="fj-col">
         <div class="cfg-label">Fields</div>
-        <div class="fj-fhead"><span>Name</span><span>Dist (km)</span><span>Area (ha)</span></div>
+        <div class="fj-fhead"><span>Name</span><span>Dist (<span class="u" data-unit="km"></span>)</span><span>Area (<span class="u" data-unit="ha"></span>)</span></div>
         <div id="fj-fieldlist" class="fj-list"></div>
         <div class="fj-btnrow">
           <button class="cfg-act" id="fj-openonly">Open Field Only</button>
@@ -1922,7 +2101,7 @@
     <div class="cfg-label">ISO-XML source (Documents/AgOpenWeb/Import)</div>
     <select class="cfg-sel fj-tx" id="iso-file"></select>
     <div class="cfg-label" style="margin-top:8px">New field name</div>
-    <input class="cfg-num fj-tx" id="iso-name" placeholder="field name">
+    <input class="cfg-num fj-tx" id="iso-name" placeholder="Field name">
     <button class="cfg-act cfg-actwide fj-primary" id="iso-create" style="margin-top:14px">Create Field</button>
   </div>
   <!-- From KML — import a .kml/.kmz from Documents/AgOpenWeb/Import. -->
@@ -1931,7 +2110,7 @@
     <div class="cfg-label">KML file (Documents/AgOpenWeb/Import)</div>
     <select class="cfg-sel fj-tx" id="kml-file"></select>
     <div class="cfg-label" style="margin-top:8px">New field name</div>
-    <input class="cfg-num fj-tx" id="kml-name" placeholder="field name">
+    <input class="cfg-num fj-tx" id="kml-name" placeholder="Field name">
     <button class="cfg-act cfg-actwide fj-primary" id="kml-create" style="margin-top:14px">Create Field</button>
   </div>
   <!-- Resume Job — cross-field recent-job picker. -->
@@ -2038,7 +2217,7 @@
       </svg>
     </div>
     <div class="rc-rows">
-      <div class="rc-row"><span>Invert Roll</span><button class="rc-tgl" id="rc-invert">Off</button></div>
+      <div class="rc-row"><span>Invert roll</span><button class="rc-tgl" id="rc-invert">Off</button></div>
       <div class="rc-row"><span>Zero Roll</span><button class="fo-btn rc-zerobtn" id="rc-zero">Zero Roll</button></div>
       <div class="rc-row"><span>Roll Zero Offset</span><span id="rc-offset" class="rc-ro">—</span></div>
     </div>
@@ -2102,7 +2281,7 @@
         <button id="fb-hl-deleteall" class="fb-act fb-del">Delete All</button>
       </div>
       <div id="fb-hl-offrow" class="fb-offrow" hidden>
-        <label>Offset</label><input id="fb-hl-off" class="cfg-num" type="number" step="0.5" min="0.5"><span>m</span>
+        <label>Offset</label><input id="fb-hl-off" class="cfg-num" data-unit="m" type="number" step="0.5" min="0.5"><span class="u" data-unit="m"></span>
       </div>
     </div>
     <!-- Add Headland sub-view (replaces the tab content) -->
@@ -2119,7 +2298,7 @@
           <option value="6">6 tool widths</option>
           <option value="0">Custom</option>
         </select>
-        <input id="fb-hl-newoff" class="cfg-num" type="number" step="0.5" min="0.5"><span>m</span>
+        <input id="fb-hl-newoff" class="cfg-num" data-unit="m" type="number" step="0.5" min="0.5"><span class="u" data-unit="m"></span>
       </div>
       <div class="fb-sublbl">Draw on Map — one line per edge; where they cross encloses the headland</div>
       <div class="fb-addrow">
@@ -2145,20 +2324,20 @@
       <div class="fb-subhdr"><button id="fb-tram-back" class="fb-act">← Back</button><span id="fb-tram-title">Edit System</span></div>
       <div class="fb-offrow"><label>Enabled</label><button id="fb-tram-en" class="cfg-tgl">On</button></div>
       <div class="fb-offrow"><label>Reference</label><select id="fb-tram-ref" class="cfg-isel"></select></div>
-      <div class="fb-offrow"><label>Tram width</label><input id="fb-tram-w" class="cfg-num" type="number" step="0.5" min="0.5"><span>m</span></div>
+      <div class="fb-offrow"><label>Tram width</label><input id="fb-tram-w" class="cfg-num" data-unit="m" type="number" step="0.5" min="0.5"><span class="u" data-unit="m"></span></div>
       <div class="fb-sublbl">Mode</div>
       <div class="fb-addrow">
         <button class="fb-addbtn" data-tmode="0"><img src="/icons/TramLines.png" alt=""><span>Wheel Track</span></button>
         <button class="fb-addbtn" data-tmode="1"><img src="/icons/TramOuter.png" alt=""><span>Edge</span></button>
       </div>
-      <div id="fb-tram-offrow" class="fb-offrow"><label>Offset</label><input id="fb-tram-off" class="cfg-num" type="number" step="0.5"><span>m</span></div>
+      <div id="fb-tram-offrow" class="fb-offrow"><label>Offset</label><input id="fb-tram-off" class="cfg-num" data-unit="m" type="number" step="0.5"><span class="u" data-unit="m"></span></div>
       <div id="fb-tram-dirlbl" class="fb-sublbl">Direction</div>
       <div id="fb-tram-dir" class="fb-addrow">
         <button class="fb-addbtn" data-tdir="1"><img src="/icons/SnapLeft.png" alt=""><span>Left</span></button>
         <button class="fb-addbtn" data-tdir="0"><img src="/icons/TramMulti.png" alt=""><span>Both</span></button>
         <button class="fb-addbtn" data-tdir="2"><img src="/icons/SnapRight.png" alt=""><span>Right</span></button>
       </div>
-      <div class="fb-offrow"><label>Passes (0 = all)</label><input id="fb-tram-passes" class="cfg-num" type="number" step="1" min="0"></div>
+      <div class="fb-offrow"><label id="fb-tram-passes-lbl">Passes (0 = all)</label><input id="fb-tram-passes" class="cfg-num" type="number" step="1" min="0"></div>
       <button id="fb-tram-done" class="fb-act" style="margin-top:6px">Done</button>
     </div>
     <!-- Add Track sub-view (replaces the tab content) -->
@@ -2189,8 +2368,8 @@
       <button class="of-btn of-ns" id="of-s" data-cmd="offset.south">S</button>
     </div>
     <div class="of-manual">
-      <div class="of-fld"><label>N / S (m)</label><input id="of-ns-in" class="of-input" type="number" step="0.001"></div>
-      <div class="of-fld"><label>E / W (m)</label><input id="of-ew-in" class="of-input" type="number" step="0.001"></div>
+      <div class="of-fld"><label>N / S (<span class="u" data-unit="m"></span>)</label><input id="of-ns-in" class="of-input" data-unit="m" type="number" step="0.001"></div>
+      <div class="of-fld"><label>E / W (<span class="u" data-unit="m"></span>)</label><input id="of-ew-in" class="of-input" data-unit="m" type="number" step="0.001"></div>
     </div>
     <div class="of-hint">1 cm per click</div>
   </div>
@@ -2252,7 +2431,7 @@
     <div class="ln-hdr"><button class="ln-x" id="bp-back" title="Back">←</button><span class="ln-hdr-title">Stop Record Pause Boundary</span><button class="ln-x ln-closex" title="Close">✕</button></div>
     <div class="bp-offrow">
       <span class="bp-offlbl">Recording Offset</span>
-      <input id="bp-offset" class="bp-offin" type="number" step="1" value="100"><span class="bp-offunit">cm</span>
+      <input id="bp-offset" class="bp-offin" data-unit="cm" type="number" step="1" value="100"><span class="bp-offunit u" data-unit="cm"></span>
     </div>
     <div class="bp-grid">
       <button id="bp-clear" class="bp-btn" title="Clear all points"><img src="/icons/Trash.png" alt=""></button>
@@ -2262,7 +2441,7 @@
       <button id="bp-leftright" class="bp-btn" title="Record on left / right side"><img id="bp-lrimg" src="/icons/BoundaryLeft.png" alt=""></button>
       <button id="bp-antennatool" class="bp-btn" title="Record at antenna / tool"><img id="bp-atimg" src="/icons/BoundaryRecordTool.png" alt=""></button>
       <div class="bp-stat"><span class="bp-statlbl">Points:</span><span id="bp-points" class="bp-statval">0</span></div>
-      <div class="bp-stat"><span class="bp-statlbl">Area:</span><span id="bp-area" class="bp-statval">0.00 Ha</span></div>
+      <div class="bp-stat"><span class="bp-statlbl">Area:</span><span id="bp-area" class="bp-statval" translate="no">0.00 Ha</span></div>
       <button id="bp-stop" class="bp-btn bp-okbtn" title="Stop and save"><img src="/icons/OK64.png" alt=""></button>
       <button id="bp-record" class="bp-btn bp-recbtn" title="Record / Pause"><img id="bp-recimg" src="/icons/BoundaryRecord.png" alt=""></button>
     </div>
@@ -2313,7 +2492,7 @@
   <!-- Hotkeys. -->
   <div id="hotkeys" class="ln-panel fm-panel">
     <div class="ln-hdr"><button class="ln-x fm-back" title="Back">←</button><span class="ln-hdr-title">Hotkeys</span><button class="ln-x ln-closex" title="Close">✕</button></div>
-    <div class="sa-hint">Click a key, then press the new key.</div>
+    <div class="sa-hint">Click a key, then press the new key. A bound key replaces the map key it shares (F follow, 3 tilt, arrows/space simulator).</div>
     <div id="hk-list" class="hk-list"></div>
     <button class="cfg-act cfg-actwide" id="hk-reset" style="margin-top:10px">Reset to Defaults</button>
   </div>
@@ -2333,18 +2512,19 @@
     <div class="ab-git" id="ab-git"></div>
     <div class="ab-desc">Cross-Platform Agricultural GPS Guidance</div>
     <div class="ab-desc">Based on AgOpenGPS by Brian Tee</div>
-    <div class="ab-desc">Avalonia UI · .NET 10 · GNU GPL v3.0</div>
+    <div class="ab-desc" translate="no">HTML/JS · .NET 10 · Apache License 2.0</div>
   </div>
   <!-- Bug Report. -->
   <div id="bugreport" class="ln-panel fm-panel">
     <div class="ln-hdr"><button class="ln-x fm-back" title="Back">←</button><span class="ln-hdr-title">Bug Report Dump</span><button class="ln-x ln-closex" title="Close">✕</button></div>
-    <div class="sa-hint">Captures a state snapshot (settings + state) to a zip in Documents/AgOpenWeb/BugReports.</div>
+    <div class="sa-hint">Captures settings, state, the field, the job's coverage and the last 5 minutes of GPS data to a zip on the host, which Download then saves on this device. The map stays live with this panel open: keep it open while driving and press the button the moment a problem shows.</div>
     <div class="cfg-label" style="margin-top:8px">Title</div>
     <input class="cfg-num fj-tx" id="br-title" placeholder="Short summary">
     <div class="cfg-label" style="margin-top:8px">Description</div>
     <textarea class="fj-notes" id="br-desc" style="height:90px"></textarea>
     <button class="cfg-act cfg-actwide fj-primary" id="br-submit" style="margin-top:10px">Create Bug Report</button>
     <div class="sa-hint" id="br-status" style="margin-top:6px"></div>
+    <button class="cfg-act cfg-actwide" id="br-download" style="margin-top:6px;display:none">Download</button>
   </div>
   <!-- Smart WAS Calibration — chain sub-panel of AutoSteer (watch-the-tractor:
        opts OUT of the light-dismiss scrim so you can pan/zoom to watch the tractor
@@ -2354,17 +2534,17 @@
     <div class="sw-status">Status: <b id="sw-status">Stopped</b></div>
     <div class="sw-card">
       <div class="sw-cardtitle">Statistics</div>
-      <div class="sw-row"><span class="k">Samples</span><span class="v" id="sw-samples">0 / 200 min</span></div>
+      <div class="sw-row"><span class="k">Samples</span><span class="v" id="sw-samples"></span></div>
       <div class="sw-row"><span class="k">Mean</span><span class="v" id="sw-mean">0.00°</span></div>
       <div class="sw-row"><span class="k">Median</span><span class="v" id="sw-median">0.00°</span></div>
       <div class="sw-row"><span class="k">Std Dev</span><span class="v" id="sw-stddev">0.00°</span></div>
     </div>
     <div class="sw-card">
       <div class="sw-cardtitle">Recommendation</div>
-      <div class="sw-row"><span class="k">Offset</span><span class="v" id="sw-offset">0.00° (0 counts)</span></div>
+      <div class="sw-row"><span class="k">Offset</span><span class="v" id="sw-offset"></span></div>
       <div class="sw-row"><span class="k">Confidence</span><span class="v" id="sw-confidence">0%</span></div>
     </div>
-    <div class="sw-info">Drive at &gt;2 km/h with autosteer engaged. Keep the cross-track error within ±0.5 m. Click Apply once confidence reaches 40%+.</div>
+    <div class="sw-info">Drive at &gt;2 kph with autosteer engaged. Keep the cross-track error within ±0.5 m. Click Apply once confidence reaches 40%+.</div>
     <div class="sw-btns">
       <button id="sw-reset" class="sw-b sw-grey rn-gated" data-cmd="smartwas.reset">Reset</button>
       <button id="sw-start" class="sw-b sw-green rn-gated" data-cmd="smartwas.start">Start</button>
@@ -2378,7 +2558,7 @@
   <div id="wizard-overlay" class="wz-overlay">
     <div class="wz-header">
       <span class="wz-title">AutoSteer Configuration Wizard</span>
-      <span class="wz-step" id="wz-step">Step 1 of 15</span>
+      <span class="wz-step" id="wz-step"></span>
       <div class="wz-progress"><div class="wz-progressbar" id="wz-progressbar"></div></div>
     </div>
     <div class="wz-body"><div id="wz-content"></div></div>
@@ -2399,6 +2579,7 @@
   </div>
   <div id="rightnav">
     <button id="rn-contour" class="rn-btn"><img id="rn-contour-i" class="rn-ic" alt="Contour"></button>
+    <button id="rn-contourlock" class="rn-btn" style="display:none"><img id="rn-contourlock-i" class="rn-ic" alt="Contour lock"></button>
     <button id="rn-manual" class="rn-btn"><img id="rn-manual-i" class="rn-ic" alt="Manual"></button>
     <button id="rn-auto" class="rn-btn"><img id="rn-auto-i" class="rn-ic" alt="Sections"></button>
     <button id="rn-youturn" class="rn-btn"><img id="rn-youturn-i" class="rn-ic" alt="U-Turn"></button>
@@ -2446,9 +2627,9 @@
       <button id="sim-steerreset" class="sim-btn" data-cmd="sim.steerReset" title="Reset steering to 0">&gt;0&lt;</button>
       <span class="sim-sep"></span>
       <button id="sim-speeddown" class="sim-btn" data-cmd="sim.speedDown" title="Slower (−0.5 kph)">▼</button>
-      <span id="sim-speedval" class="sim-speed">0.0 kph</span>
+      <span id="sim-speedval" class="sim-speed" translate="no">0.0 kph</span>
       <button id="sim-speedup" class="sim-btn" data-cmd="sim.speedUp" title="Faster (+0.5 kph)">▲</button>
-      <button id="sim-stop" class="sim-btn sim-stopbtn" data-cmd="sim.stop" title="Stop">STOP</button>
+      <button id="sim-stop" class="sim-btn sim-stopbtn" data-cmd="sim.stop" title="Stop">Stop</button>
       <button id="sim-10x" class="sim-toggle" data-cmd="sim.toggle10x" title="10× speed multiplier">10x</button>
       <span class="sim-sep"></span>
       <button id="sim-reverse" class="sim-btn" data-cmd="sim.reverseDir" title="Reverse direction (flip 180°)">⇅</button>
@@ -2475,7 +2656,8 @@
         <!-- Mirrors native BottomNavigationPanel AB flyout. Row 1: Tracks manager /
              Auto-track / Quick-AB (the single creation hub — GPS-driven, from-boundary,
              and draw-on-map all live in its dialog). Then the active-track ops
-             (cycle/smooth/delete + nudges), shown only with an active track (.bn-abdep). -->
+             (cycle/smooth/delete, A/B end length, nudge), shown only with an active track
+             (.bn-abdep). Length and nudge are unrelated, so a divider separates them (#93). -->
         <div class="bn-flyrow">
           <button class="bn-btn" id="bn-tracks" title="Tracks — manage AB lines"><img class="bn-ic" src="/icons/ABTracks.png" alt="Tracks"></button>
           <button class="bn-btn" id="bn-quickab" title="Quick AB line creator"><img class="bn-ic" src="/icons/ABTrackAPlus.png" alt="Quick AB"></button>
@@ -2485,26 +2667,27 @@
         <div class="bn-flyrow bn-abdep">
           <button class="bn-btn" data-cmd="track.cycle" data-t2 title="Cycle AB lines"><img class="bn-ic" src="/icons/ABLineCycle.png" alt="Cycle"></button>
           <button class="bn-btn" data-cmd="track.smooth" data-t2 title="Smooth AB curve"><img class="bn-ic" src="/icons/ABSmooth.png" alt="Smooth"></button>
-          <button class="bn-btn" data-cmd="track.deleteContours" data-t2 title="Delete contours"><img class="bn-ic" src="/icons/TrashContourRef.png" alt="Delete contours"></button>
+          <button class="bn-btn" id="bn-delcontours" data-t2 title="Delete contour paths"><img class="bn-ic" src="/icons/TrashContourRef.png" alt="Delete contours"></button>
         </div>
         <div class="bn-flysep bn-abdep"></div>
         <div class="bn-flyrow bn-abdep">
-          <button class="bn-btn" data-cmd="track.nudgeLeft" data-t2 title="Nudge left (A+)"><img class="bn-ic" src="/icons/APlusPlusA.png" alt="Nudge L"></button>
-          <button class="bn-btn" data-cmd="track.nudgeRight" data-t2 title="Nudge right (B+)"><img class="bn-ic" src="/icons/APlusPlusB.png" alt="Nudge R"></button>
+          <button class="bn-btn" data-cmd="track.extendA" data-t2 title="Extend line at A (+5 m)"><img class="bn-ic" src="/icons/APlusPlusA.png" alt="Extend A"></button>
+          <button class="bn-btn" data-cmd="track.extendB" data-t2 title="Extend line at B (+5 m)"><img class="bn-ic" src="/icons/APlusPlusB.png" alt="Extend B"></button>
         </div>
         <div class="bn-flyrow bn-abdep">
-          <button class="bn-btn" data-cmd="track.fineNudgeLeft" data-t2 title="Fine nudge left (A−)"><img class="bn-ic" src="/icons/APlusMinusA.png" alt="Fine L"></button>
-          <button class="bn-btn" data-cmd="track.fineNudgeRight" data-t2 title="Fine nudge right (B−)"><img class="bn-ic" src="/icons/APlusMinusB.png" alt="Fine R"></button>
+          <button class="bn-btn" data-cmd="track.shrinkA" data-t2 title="Shorten line at A (−5 m)"><img class="bn-ic" src="/icons/APlusMinusA.png" alt="Shorten A"></button>
+          <button class="bn-btn" data-cmd="track.shrinkB" data-t2 title="Shorten line at B (−5 m)"><img class="bn-ic" src="/icons/APlusMinusB.png" alt="Shorten B"></button>
         </div>
+        <div class="bn-flysep bn-abdep"></div>
         <div class="bn-flyrow bn-abdep">
-          <button class="bn-btn" data-cmd="track.halfNudgeLeft" data-t2 title="Nudge left half tool width">&lt;&lt;</button>
-          <button class="bn-btn" data-cmd="track.resetNudge" data-t2 title="Reset nudge">0</button>
-          <button class="bn-btn" data-cmd="track.halfNudgeRight" data-t2 title="Nudge right half tool width">&gt;&gt;</button>
+          <button class="bn-btn" data-cmd="track.nudgeLeft" data-t2 title="Nudge line left">&lt;&lt;</button>
+          <button class="bn-btn" id="bn-nudge" data-cmd="track.resetNudge" data-t2 title="Current nudge — tap to reset to 0"><span id="bn-nudgeval">0</span></button>
+          <button class="bn-btn" data-cmd="track.nudgeRight" data-t2 title="Nudge line right">&gt;&gt;</button>
         </div>
       </div>
       <div class="bn-bar">
         <button class="bn-btn bn-abdep" id="bn-skipcycle" data-cmd="youturn.skipCycle" data-t2 title="U-Turn skip rows (tap to cycle 0–9)"><span id="bn-skipnum">0</span></button>
-        <button class="bn-btn bn-abdep" id="bn-skiptoggle" data-cmd="youturn.skipToggle" data-t2 title="U-Turn skip rows on/off"><img class="bn-ic" id="bn-skip-ic" alt="Skip"></button>
+        <button class="bn-btn bn-abdep" id="bn-skiptoggle" data-cmd="youturn.skipToggle" data-t2 title="U-Turn skip mode: normal / alternative / skip worked tracks"><img class="bn-ic" id="bn-skip-ic" alt="Skip"></button>
         <button class="bn-btn" data-cmd="map.cycleColor" title="Section mapping colour"><img class="bn-ic" src="/icons/SectionMapping.png" alt="Mapping colour"></button>
         <button class="bn-btn" data-cmd="tool.resetHeading" title="Reset tool heading"><img class="bn-ic" src="/icons/ResetTool.png" alt="Reset tool"></button>
         <button class="bn-btn" id="bn-secheadland" data-cmd="headland.sectionToggle" data-t2 title="Section control in headland"><img class="bn-ic" id="bn-secheadland-ic" alt="Section in headland"></button>
@@ -2521,6 +2704,23 @@
   <!-- Dialog host (Phase 6): the web mirror of DialogOverlayHost — one modal at a
        time over a dimming backdrop. SimCoords is the first dialog; later phases add
        more cards into this same host. -->
+  <!-- Host prompt (#109): the host's pending confirm/error dialog (Prompt frame). Only the
+       browser holding control can answer; others see who can. -->
+  <div id="hostprompt">
+    <div class="dlg-card">
+      <div class="dlg-title" id="hp-title"></div>
+      <div class="dlg-msg" id="hp-msg"></div>
+      <label id="hp-check" hidden><input type="checkbox" id="hp-checkbox"><span id="hp-checklabel"></span></label>
+      <div class="dlg-buttons">
+        <button id="hp-cancel" class="dlg-btn dlg-cancel">No</button>
+        <button id="hp-ok" class="dlg-btn dlg-ok">Yes</button>
+      </div>
+      <div id="hp-wait" hidden></div>
+    </div>
+  </div>
+  <div id="toast"></div>
+  <div id="hwmsg"></div>
+  <div id="osk" hidden></div>
   <div id="dialoghost">
     <div class="dlg-backdrop"></div>
     <div id="dlg-simcoords" class="dlg-card">
@@ -2532,6 +2732,15 @@
       <div class="dlg-buttons">
         <button id="dlg-cancel" class="dlg-btn dlg-cancel">Cancel</button>
         <button id="dlg-ok" class="dlg-btn dlg-ok">OK</button>
+      </div>
+    </div>
+    <!-- Drive In pick list (#109, AgOpenGPS FormDrivePicker): 2+ fields within 0.5 km. -->
+    <div id="dlg-drivepick" class="dlg-card">
+      <div class="dlg-title">Fields Nearby</div>
+      <div class="dlg-msg">More than one field is within 0.5 km. Pick the one you're in.</div>
+      <div id="dp-list"></div>
+      <div class="dlg-buttons">
+        <button id="dp-cancel" class="dlg-btn dlg-cancel">Cancel</button>
       </div>
     </div>
     <!-- Shared confirm (replaces browser confirm() + native ShowConfirmationDialog).
@@ -2610,6 +2819,7 @@
   <script src="/vendor/canvaskit.js"></script>
   <!-- Binary-WebSocket transport — no external client lib (works offline in-cab). -->
   <script src="/transport.js"></script>
+  <script src="/i18n.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

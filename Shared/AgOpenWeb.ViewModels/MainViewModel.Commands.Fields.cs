@@ -29,6 +29,7 @@ using AgOpenWeb.Models.IsoXml;
 using AgOpenWeb.Models.State;
 using AgOpenWeb.Models.Track;
 using AgOpenWeb.Services;
+using AgOpenWeb.Services.GeoJson;
 using AgOpenWeb.Services.IsoXml;
 using CommunityToolkit.Mvvm.Input;
 
@@ -107,8 +108,7 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
             _fieldSelectionDirectory = fieldsDir;
             PopulateAvailableFields(fieldsDir);
@@ -129,8 +129,7 @@ public partial class MainViewModel
             var fieldName = SelectedFieldInfo.Name;
 
             // Check if this is a legacy field that will be auto-converted
-            bool isLegacy = !File.Exists(Path.Combine(fieldPath, "field.geojson")) &&
-                            File.Exists(Path.Combine(fieldPath, "Field.txt"));
+            bool isLegacy = File.Exists(Path.Combine(fieldPath, "Field.txt"));
 
             if (isLegacy)
             {
@@ -139,7 +138,7 @@ public partial class MainViewModel
                     "Import Legacy Field",
                     $"'{fieldName}' uses the legacy AgOpenGPS format. " +
                     "It will be imported and converted to the new format. " +
-                    "The original files will be kept. Continue?",
+                    "Its AgOpenGPS files in this folder are deleted once imported. Continue?",
                     () =>
                     {
                         SelectedFieldInfo = null;
@@ -174,7 +173,7 @@ public partial class MainViewModel
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Error deleting field: {ex.Message}";
+                ReportFailure($"Error deleting field: {ex.Message}");
             }
         });
 
@@ -206,7 +205,7 @@ public partial class MainViewModel
             NewFieldName = string.Empty;
         });
 
-        ConfirmNewFieldDialogCommand = new RelayCommand(() =>
+        ConfirmNewFieldDialogCommand = new AsyncRelayCommand(async () =>
         {
             if (string.IsNullOrWhiteSpace(NewFieldName))
             {
@@ -218,8 +217,7 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
 
             var fieldPath = Path.Combine(fieldsDir, NewFieldName);
@@ -232,63 +230,15 @@ public partial class MainViewModel
             try
             {
                 Directory.CreateDirectory(fieldPath);
+                WriteNewFieldSkeleton(fieldPath, NewFieldName, NewFieldLatitude, NewFieldLongitude);
 
-                // Lat/lon must be written with InvariantCulture (period
-                // decimal). FieldPlaneFileService.LoadField parses with
-                // InvariantCulture; using current culture here would write
-                // "42,03" in locales like fi-FI, the parser would silently
-                // reject it, the field would end up with origin (0,0), and
-                // FindFieldsNear would drop it from "near me" results.
-                var inv = CultureInfo.InvariantCulture;
-                var latStr = NewFieldLatitude.ToString("F8", inv);
-                var lonStr = NewFieldLongitude.ToString("F8", inv);
-
-                var originFile = Path.Combine(fieldPath, "field.origin");
-                File.WriteAllText(originFile, $"{latStr},{lonStr}");
-
-                var fieldTxtPath = Path.Combine(fieldPath, "Field.txt");
-                var fieldTxtContent =
-                    $"{DateTime.Now.ToString("yyyy-MMM-dd hh:mm:ss tt", inv)}\n" +
-                    "$FieldDir\n" +
-                    $"{NewFieldName}\n" +
-                    "$Offsets\n" +
-                    "0,0\n" +
-                    "Convergence\n" +
-                    "0\n" +
-                    "StartFix\n" +
-                    $"{latStr},{lonStr}\n";
-                File.WriteAllText(fieldTxtPath, fieldTxtContent);
-
-                FieldsRootDirectory = fieldsDir;
-                IsFieldOpen = true;
-
-                // Set field origin for coordinate transformations
-                SetFieldOrigin(NewFieldLatitude, NewFieldLongitude);
-
-                // Create field object and set as active (required for headland/track
-                // saving). CurrentFieldName is a pass-through over ActiveField.Name.
-                var field = new Field
-                {
-                    Name = NewFieldName,
-                    DirectoryPath = fieldPath,
-                    Boundary = null
-                };
-                _fieldService.SetActiveField(field);
-
-                // Create elevation log header if enabled (#120)
-                if (_configStore.Display.ElevationLogEnabled)
-                    _elevationLogService.CreateHeader(fieldPath, NewFieldLatitude, NewFieldLongitude);
-
-                PersistentState.LastOpenedField = NewFieldName;
-                _persistentStateService.Save();
-
-                State.UI.CloseDialog();
-                IsFieldOperationsPanelVisible = false;
-                StatusMessage = $"Created field: {NewFieldName}";
+                var name = NewFieldName;
+                await OpenCreatedFieldAsync(fieldPath, name);
+                StatusMessage = $"Created field: {name}";
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Error creating field: {ex.Message}";
+                ReportFailure($"Error creating field: {ex.Message}");
             }
         });
 
@@ -299,8 +249,7 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
             _fieldSelectionDirectory = fieldsDir;
             PopulateAvailableFields(fieldsDir);
@@ -327,7 +276,7 @@ public partial class MainViewModel
             FromExistingFieldName = string.Empty;
         });
 
-        ConfirmFromExistingFieldDialogCommand = new RelayCommand(() =>
+        ConfirmFromExistingFieldDialogCommand = new AsyncRelayCommand(async () =>
         {
             if (FromExistingSelectedField == null)
             {
@@ -346,14 +295,13 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
 
             var sourcePath = Path.Combine(fieldsDir, FromExistingSelectedField.Name);
             var newFieldPath = Path.Combine(fieldsDir, newFieldName);
 
-            if (Directory.Exists(newFieldPath) && newFieldName != FromExistingSelectedField.Name)
+            if (Directory.Exists(newFieldPath))
             {
                 StatusMessage = $"Field '{newFieldName}' already exists";
                 return;
@@ -361,77 +309,17 @@ public partial class MainViewModel
 
             try
             {
-                Directory.CreateDirectory(newFieldPath);
-
-                var originFile = Path.Combine(sourcePath, "field.origin");
-                if (File.Exists(originFile))
-                {
-                    File.Copy(originFile, Path.Combine(newFieldPath, "field.origin"), true);
-                }
-
-                var boundaryFile = Path.Combine(sourcePath, "boundary.json");
-                if (File.Exists(boundaryFile))
-                {
-                    File.Copy(boundaryFile, Path.Combine(newFieldPath, "boundary.json"), true);
-                }
-
-                if (CopyFlags)
-                {
-                    var flagsFile = Path.Combine(sourcePath, "flags.json");
-                    if (File.Exists(flagsFile))
-                    {
-                        File.Copy(flagsFile, Path.Combine(newFieldPath, "flags.json"), true);
-                    }
-                }
-
-                if (CopyMapping)
-                {
-                    var mappingFile = Path.Combine(sourcePath, "mapping.json");
-                    if (File.Exists(mappingFile))
-                    {
-                        File.Copy(mappingFile, Path.Combine(newFieldPath, "mapping.json"), true);
-                    }
-                }
-
-                if (CopyHeadland)
-                {
-                    var headlandFile = Path.Combine(sourcePath, "headland.json");
-                    if (File.Exists(headlandFile))
-                    {
-                        File.Copy(headlandFile, Path.Combine(newFieldPath, "headland.json"), true);
-                    }
-                }
-
-                if (CopyLines)
-                {
-                    var linesFile = Path.Combine(sourcePath, "lines.json");
-                    if (File.Exists(linesFile))
-                    {
-                        File.Copy(linesFile, Path.Combine(newFieldPath, "lines.json"), true);
-                    }
-                    var abLinesFile = Path.Combine(sourcePath, "ablines.json");
-                    if (File.Exists(abLinesFile))
-                    {
-                        File.Copy(abLinesFile, Path.Combine(newFieldPath, "ablines.json"), true);
-                    }
-                }
-
-                FieldsRootDirectory = fieldsDir;
-                IsFieldOpen = true;
-                // Set the active field so State.Field is the SoT (CurrentFieldName reads
-                // ActiveField.Name). Previously this flow left ActiveField null.
-                _fieldService.SetActiveField(new Field { Name = newFieldName, DirectoryPath = newFieldPath });
-
-                PersistentState.LastOpenedField = newFieldName;
-                _persistentStateService.Save();
-
-                State.UI.CloseDialog();
-                IsFieldOperationsPanelVisible = false;
+                // Build the new field from the source's real files (#107: this used to copy
+                // *.json names nothing writes, giving an essentially empty field), then open it
+                // through the normal path — which closes (and saves) the current field first.
+                FieldCopyService.CreateFromExisting(_fieldService, sourcePath, newFieldPath, newFieldName,
+                    CopyFlags, CopyMapping, CopyHeadland, CopyLines);
+                await OpenCreatedFieldAsync(newFieldPath, newFieldName);
                 StatusMessage = $"Created field from existing: {newFieldName}";
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Error creating field: {ex.Message}";
+                ReportFailure($"Error creating field: {ex.Message}");
             }
         });
 
@@ -498,7 +386,7 @@ public partial class MainViewModel
             KmlImportFieldName = string.Empty;
         });
 
-        ConfirmKmlImportDialogCommand = new RelayCommand(() =>
+        ConfirmKmlImportDialogCommand = new AsyncRelayCommand(async () =>
         {
             if (SelectedKmlFile == null)
             {
@@ -531,8 +419,7 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
 
             var newFieldPath = Path.Combine(fieldsDir, newFieldName);
@@ -545,9 +432,8 @@ public partial class MainViewModel
             try
             {
                 Directory.CreateDirectory(newFieldPath);
-
-                var originFile = Path.Combine(newFieldPath, "field.origin");
-                File.WriteAllText(originFile, $"{KmlCenterLatitude:F8},{KmlCenterLongitude:F8}");
+                // field.origin + field.geojson, which the open path needs.
+                WriteNewFieldSkeleton(newFieldPath, newFieldName, KmlCenterLatitude, KmlCenterLongitude);
 
                 var origin = new Wgs84(KmlCenterLatitude, KmlCenterLongitude);
                 var sharedProps = new SharedFieldProperties();
@@ -572,41 +458,18 @@ public partial class MainViewModel
                         boundary.InnerBoundaries.Add(polygon);
                 }
 
-                _boundaryFileService.SaveBoundary(boundary, newFieldPath);
+                SaveFieldBoundary(boundary, newFieldPath);
 
-                // Set field origin so coordinate conversions work
-                SetFieldOrigin(KmlCenterLatitude, KmlCenterLongitude);
-
-                FieldsRootDirectory = fieldsDir;
-                IsFieldOpen = true;
-                // Set the active field first (SoT) so CurrentFieldName resolves and the
-                // boundary set below attaches to it. Previously ActiveField was left null.
-                _fieldService.SetActiveField(new Field { Name = newFieldName, DirectoryPath = newFieldPath });
-
-                // Load boundary into map renderer
-                SetCurrentBoundary(boundary);
-                CenterMapOnBoundary(boundary);
-
-                // Update boundary area stats
-                var boundaryAreas = new List<double> { boundary.AreaHectares * 10000 };
-                _fieldStatistics.UpdateBoundaryAreas(boundaryAreas);
-                OnPropertyChanged(nameof(BoundaryAreaDisplay));
-
-                PersistentState.LastOpenedField = newFieldName;
-                _persistentStateService.Save();
-
-                RefreshBoundaryList();
-                SetSimulatorCoordinates(State.Field.OriginLatitude, State.Field.OriginLongitude);
-
-                State.UI.CloseDialog();
-                IsFieldOperationsPanelVisible = false;
+                // Open through the normal path: closes (and saves) the current field first
+                // and loads the new one, boundary included (#107).
+                await OpenCreatedFieldAsync(newFieldPath, newFieldName);
                 var innerCount = _kmlParsedPolygons.Count - 1;
                 var innerMsg = innerCount > 0 ? $" ({innerCount} inner boundaries)" : "";
                 StatusMessage = $"Imported KML: {newFieldName}{innerMsg}";
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Error importing KML: {ex.Message}";
+                ReportFailure($"Error importing KML: {ex.Message}");
             }
         });
 
@@ -652,7 +515,7 @@ public partial class MainViewModel
             IsoXmlImportFieldName = string.Empty;
         });
 
-        ConfirmIsoXmlImportDialogCommand = new RelayCommand(() =>
+        ConfirmIsoXmlImportDialogCommand = new AsyncRelayCommand(async () =>
         {
             if (SelectedIsoXmlFile == null)
             {
@@ -671,8 +534,7 @@ public partial class MainViewModel
             if (string.IsNullOrWhiteSpace(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
 
             var newFieldPath = Path.Combine(fieldsDir, newFieldName);
@@ -701,7 +563,7 @@ public partial class MainViewModel
                 var pfd = doc.SelectSingleNode("//PFD");
                 if (pfd == null)
                 {
-                    StatusMessage = "ISO-XML file contains no field (PFD)";
+                    ReportFailure("ISO-XML file contains no field (PFD)");
                     return;
                 }
                 var fieldParts = pfd.ChildNodes;
@@ -710,7 +572,7 @@ public partial class MainViewModel
                 // the centroid of the outer boundary (falling back to all points).
                 if (!TryComputeIsoXmlOrigin(pfd, out double originLat, out double originLon))
                 {
-                    StatusMessage = "ISO-XML file has no coordinates to import";
+                    ReportFailure("ISO-XML file has no coordinates to import");
                     return;
                 }
                 var localPlane = new LocalPlane(new Wgs84(originLat, originLon), new SharedFieldProperties());
@@ -718,15 +580,14 @@ public partial class MainViewModel
                 var parsedBoundaries = IsoXmlParserHelpers.ParseBoundaries(fieldParts, localPlane);
                 if (parsedBoundaries.Count == 0 || parsedBoundaries[0].FenceLine.Count < 3)
                 {
-                    StatusMessage = "ISO-XML file has no usable boundary";
+                    ReportFailure("ISO-XML file has no usable boundary");
                     return;
                 }
                 var parsedHeadland = IsoXmlParserHelpers.ParseHeadland(fieldParts, localPlane);
                 var parsedTracks = IsoXmlParserHelpers.ParseAllGuidanceLines(fieldParts, localPlane);
 
                 Directory.CreateDirectory(newFieldPath);
-                File.WriteAllText(Path.Combine(newFieldPath, "field.origin"),
-                    $"{originLat.ToString("F8", CultureInfo.InvariantCulture)},{originLon.ToString("F8", CultureInfo.InvariantCulture)}");
+                WriteNewFieldSkeleton(newFieldPath, newFieldName, originLat, originLon);
 
                 // Build the boundary (first = outer, rest = inner holes).
                 var boundary = new Boundary();
@@ -772,40 +633,22 @@ public partial class MainViewModel
                     if (track.Points.Count >= 2) tracks.Add(track);
                 }
 
-                // Activate the field first so the headland save (which writes to
-                // ActiveField.DirectoryPath) targets the new field.
-                SetFieldOrigin(originLat, originLon);
-                FieldsRootDirectory = fieldsDir;
-                IsFieldOpen = true;
-                _fieldService.SetActiveField(new Field { Name = newFieldName, DirectoryPath = newFieldPath });
+                // Persist the boundary + tracks, then open through the normal path, which closes
+                // (and saves) the current field first and loads the new one (#107).
+                SaveFieldBoundary(boundary, newFieldPath);
+                if (tracks.Count > 0)
+                    GeoJsonFieldService.SaveTracks(newFieldPath, tracks);
+                await OpenCreatedFieldAsync(newFieldPath, newFieldName);
 
-                // Persist to disk so the field re-opens with everything intact.
-                _boundaryFileService.SaveBoundary(boundary, newFieldPath);
+                // The headland save writes to the ACTIVE field, so it runs once the new field is
+                // open; then reload it into the live state.
                 if (boundary.HeadlandPolygon != null)
+                {
                     SaveHeadlandToFile(boundary.HeadlandPolygon.Points
                         .Select(p => new Vec3(p.Easting, p.Northing, 0)).ToList());
-                if (tracks.Count > 0)
-                    TrackFilesService.Save(newFieldPath, tracks);
+                    LoadHeadlandFromField(_fieldService.ActiveField);
+                }
 
-                // Load into the live map + collections (mirrors the KML import path).
-                SetCurrentBoundary(boundary);
-                CenterMapOnBoundary(boundary);
-
-                var boundaryAreas = new List<double> { boundary.AreaHectares * 10000 };
-                _fieldStatistics.UpdateBoundaryAreas(boundaryAreas);
-                OnPropertyChanged(nameof(BoundaryAreaDisplay));
-
-                SavedTracks.Clear();
-                foreach (var tk in tracks) SavedTracks.Add(tk);
-
-                PersistentState.LastOpenedField = newFieldName;
-                _persistentStateService.Save();
-
-                RefreshBoundaryList();
-                SetSimulatorCoordinates(State.Field.OriginLatitude, State.Field.OriginLongitude);
-
-                State.UI.CloseDialog();
-                IsFieldOperationsPanelVisible = false;
                 var innerCount = parsedBoundaries.Count - 1;
                 var extras = new List<string>();
                 if (innerCount > 0) extras.Add($"{innerCount} inner");
@@ -815,7 +658,7 @@ public partial class MainViewModel
             }
             catch (Exception ex)
             {
-                StatusMessage = $"Error importing ISO-XML: {ex.Message}";
+                ReportFailure($"Error importing ISO-XML: {ex.Message}");
             }
         });
 
@@ -846,8 +689,8 @@ public partial class MainViewModel
             {
                 await CloseFieldAsync();
 
-                // Disconnect NTRIP if connected
-                if (_ntripService.IsConnected)
+                // Disconnect NTRIP if connected (or connecting / retrying)
+                if (_ntripService.IsActive)
                 {
                     await _ntripService.DisconnectAsync();
                 }
@@ -866,13 +709,13 @@ public partial class MainViewModel
         // "Drive In" — AgOpen-style nearby-field shortcut. Looks for fields
         // whose origin is within 0.5 km of the operator's current GPS fix
         // (matches AgOpenGPS FormJob.btnInField_Click). One match opens
-        // directly; multiple matches go through StartWorkSessionDialog
-        // pre-filtered to nearby. Zero matches surface a status message.
+        // directly; multiple matches are offered as a pick list (#109).
+        // Zero matches surface a failure message.
         DriveInCommand = new RelayCommand(() =>
         {
             if (Latitude == 0 && Longitude == 0)
             {
-                StatusMessage = "No GPS fix — Drive In needs current position";
+                ReportFailure("No GPS fix — Drive In needs current position");
                 return;
             }
 
@@ -881,7 +724,7 @@ public partial class MainViewModel
 
             if (nearby.Count == 0)
             {
-                StatusMessage = "No fields within 0.5 km";
+                ReportFailure("No fields within 0.5 km");
                 return;
             }
 
@@ -893,24 +736,10 @@ public partial class MainViewModel
                 return;
             }
 
-            // 2+ — open the picker with the list pre-filtered to nearby.
-            StartWorkSessionDialogVm = new StartWorkSessionDialogViewModel(
-                _fieldService,
-                _jobService,
-                _settingsService,
-                _appState,
-                close: () => State.UI.CloseDialog(),
-                openField: (path, name) => _ = OpenFieldOnlyAsync(path, name),
-                openFieldStartingNewJob: (path, name, workType, notes, taskName) =>
-                    _ = OpenFieldStartingNewJobAsync(path, name, workType, notes, taskName),
-                openFieldResumingJob: (path, name, taskName) =>
-                    _ = OpenFieldResumingJobAsync(path, name, taskName),
-                confirm: (msg, action) => ShowConfirmationDialog("Delete Job", msg, action),
-                confirmWithOption: (title, msg, checkboxLabel, defaultChecked, action) =>
-                    ShowConfirmationDialog(title, msg, checkboxLabel, defaultChecked, action),
-                nearbyMaxKm: 0.5);
-            StartWorkSessionDialogVm.Refresh();
-            OpenChainDialog(DialogType.StartWorkSession);
+            // 2+ — let the operator pick one (AgOpenGPS FormDrivePicker). The web shows
+            // the list; DriveInOpen opens the choice the same way as a single match.
+            _driveInCandidates = nearby.ToList();
+            DriveInPickRequested?.Invoke(_driveInCandidates);
         });
 
         ResumeFieldCommand = new AsyncRelayCommand(async () =>
@@ -918,7 +747,7 @@ public partial class MainViewModel
             var lastField = PersistentState.LastOpenedField;
             if (string.IsNullOrEmpty(lastField))
             {
-                StatusMessage = "No previous field to resume";
+                ReportFailure("No previous field to resume");
                 return;
             }
 
@@ -927,8 +756,7 @@ public partial class MainViewModel
             if (string.IsNullOrEmpty(fieldsDir))
             {
                 fieldsDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                    "AgOpenWeb", "Fields");
+                    AppDataRoot.Documents, "Fields");
             }
 
             var fieldPath = Path.Combine(fieldsDir, lastField);
@@ -940,8 +768,7 @@ public partial class MainViewModel
             }
 
             // Check if this is a legacy field that will be auto-converted
-            bool isLegacy = !File.Exists(Path.Combine(fieldPath, "field.geojson")) &&
-                            File.Exists(Path.Combine(fieldPath, "Field.txt"));
+            bool isLegacy = File.Exists(Path.Combine(fieldPath, "Field.txt"));
 
             if (isLegacy)
             {
@@ -949,7 +776,7 @@ public partial class MainViewModel
                     "Import Legacy Field",
                     $"'{lastField}' uses the legacy AgOpenGPS format. " +
                     "It will be imported and converted to the new format. " +
-                    "The original files will be kept. Continue?",
+                    "Its AgOpenGPS files in this folder are deleted once imported. Continue?",
                     () =>
                     {
                         _ = OpenFieldAsync(fieldPath, lastField).ContinueWith(_ =>
@@ -972,6 +799,29 @@ public partial class MainViewModel
     /// confirm before sending a delete). The web sets SelectedField / the new-job form
     /// then executes the VM's commands; we Refresh() so the lists are current.
     /// </summary>
+    // Drive In pick list (#109): the fields the last Drive In found within 0.5 km.
+    private List<NearbyField> _driveInCandidates = new();
+
+    /// <summary>Raised when Drive In finds 2+ fields within 0.5 km; the web shows them as
+    /// a pick list (AgOpenGPS FormDrivePicker) and answers with <see cref="DriveInOpen"/>.</summary>
+    public event Action<IReadOnlyList<NearbyField>>? DriveInPickRequested;
+
+    /// <summary>Open the field picked from the Drive In list, the same way Drive In opens
+    /// a single match. Only a name from the last Drive In list is accepted.</summary>
+    public void DriveInOpen(string name)
+    {
+        var f = _driveInCandidates.FirstOrDefault(c =>
+            string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (f == null)
+        {
+            ReportFailure("Press Drive In again");
+            return;
+        }
+        _driveInCandidates = new();
+        _ = OpenFieldAsync(f.DirectoryPath, f.Name);
+        IsFieldOperationsPanelVisible = false;
+    }
+
     public StartWorkSessionDialogViewModel EnsureRemoteStartWorkSession()
     {
         StartWorkSessionDialogVm = new StartWorkSessionDialogViewModel(
@@ -987,6 +837,7 @@ public partial class MainViewModel
                 _ = OpenFieldResumingJobAsync(path, name, taskName),
             confirm: (_, action) => action(),
             confirmWithOption: (_, _, _, _, action) => action(true));
+        StartWorkSessionDialogVm.FailureReported += ReportFailure;
         StartWorkSessionDialogVm.Refresh();
         return StartWorkSessionDialogVm;
     }
@@ -998,8 +849,40 @@ public partial class MainViewModel
     {
         var dir = _settingsService.Settings.FieldsDirectory;
         return string.IsNullOrWhiteSpace(dir)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "AgOpenWeb", "Fields")
+            ? Path.Combine(AppDataRoot.Documents, "Fields")
             : dir;
+    }
+
+    /// <summary>
+    /// Write the files a brand-new field needs before it can be opened: field.origin and
+    /// field.geojson (origin, no boundary yet). field.origin is InvariantCulture: a comma-decimal
+    /// culture once wrote "42,03", the origin fell back to 0,0 and "near me" dropped the field.
+    /// </summary>
+    private static void WriteNewFieldSkeleton(string fieldPath, string name, double lat, double lon)
+    {
+        var inv = CultureInfo.InvariantCulture;
+        File.WriteAllText(Path.Combine(fieldPath, "field.origin"), $"{lat.ToString("F8", inv)},{lon.ToString("F8", inv)}");
+        GeoJsonFieldService.Save(new Field
+        {
+            Name = name,
+            DirectoryPath = fieldPath,
+            Origin = new Position { Latitude = lat, Longitude = lon },
+            CreatedDate = DateTime.Now,
+            LastModifiedDate = DateTime.Now,
+        }, tracks: null);
+    }
+
+    /// <summary>
+    /// Open a field that was just created on disk (New / From Existing / KML / ISO-XML)
+    /// through the normal open path, which closes — and saves — the current field first and
+    /// loads everything for the new one. Previously each flow set the active field by hand,
+    /// so the previous field's tracks, flags, coverage and job carried over unsaved (#107).
+    /// </summary>
+    private async Task OpenCreatedFieldAsync(string fieldPath, string name)
+    {
+        State.UI.CloseDialog();
+        IsFieldOperationsPanelVisible = false;
+        await OpenFieldOnlyAsync(fieldPath, name);
     }
 
     public void RemoteCreateFromExisting(string sourceName, string newName,
@@ -1015,6 +898,10 @@ public partial class MainViewModel
 
     public void RemoteCreateFromKml(string fileName, string newName)
     {
+        // From KML always creates a field. A boundary import (RemoteImportKmlBoundary) sets
+        // this flag and only the native dialog cleared it, so the next From KML imported
+        // into the open field instead (#111).
+        _kmlImportToExistingField = false;
         PopulateAvailableKmlFiles();
         SelectedKmlFile = AvailableKmlFiles.FirstOrDefault(f =>
             string.Equals(f.Name, fileName, StringComparison.OrdinalIgnoreCase));

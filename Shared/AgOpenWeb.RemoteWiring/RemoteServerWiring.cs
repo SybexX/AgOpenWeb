@@ -17,12 +17,10 @@ namespace AgOpenWeb.RemoteWiring;
 public static partial class RemoteServerWiring
 {
     // Wire the RemoteServer's command handler, Tier-2 gating, authority/failsafe
-    // hooks, and every state projector to a live MainViewModel. Shared by the
-    // windowed host (App.OnFrameworkInitializationCompleted) and the headless host
-    // (HeadlessHost). The ONLY behavioural difference is the injected IUiDispatcher
-    // resolved below: the Avalonia UI thread when windowed, the single-thread
-    // HostLoopDispatcher when headless. Commands + projectors are otherwise
-    // identical. See Plans/WEBUI_MIGRATION_PLAN.md Phase 10.
+    // hooks, and every state projector to a live MainViewModel. Shared by every
+    // head (WebBackend) and the headless host (HeadlessHost). All of them inject the
+    // single-thread HostLoopDispatcher as IUiDispatcher, resolved below.
+    // See Plans/WEBUI_MIGRATION_PLAN.md Phase 10.
     public static void Wire(
         AgOpenWeb.RemoteServer.RemoteServerHost server,
         AgOpenWeb.ViewModels.MainViewModel vm,
@@ -30,9 +28,7 @@ public static partial class RemoteServerWiring
         IConfigurationService configService,
         IBoundaryImageryCapture imageryCapture)
     {
-        // UI-thread marshaller. Windowed => AvaloniaUiDispatcher (Dispatcher.UIThread);
-        // headless => HostLoopDispatcher (the dedicated host-loop thread). Replaces the
-        // old hardcoded Avalonia.Threading.Dispatcher.UIThread.Post in this block.
+        // "UI thread" marshaller: the HostLoopDispatcher (the dedicated host-loop thread).
         var dispatcher = services.GetRequiredService<IUiDispatcher>();
 
         // AgShareRemote marshals its async cloud-op results back to the UI thread via
@@ -53,6 +49,12 @@ public static partial class RemoteServerWiring
                         {
                             var inv = System.Globalization.CultureInfo.InvariantCulture;
                             var num = System.Globalization.NumberStyles.Float;
+                            // Starting a line or path turns contour off first, like AgOpenGPS's
+                            // track / AB+ / draw / record / path Go buttons (#110).
+                            if (vm.IsContourModeOn && cmd is "track.activate" or "track.aPlus" or "track.drawStraight"
+                                    or "track.drawCurve" or "track.recordCurve" or "track.driveAB" or "recpath.play")
+                                vm.ToggleContourModeCommand?.Execute(null);
+
                             // Sim ids that set a property or carry an arg (all Tier-1,
                             // hardware-safe) are handled directly; the rest map to a VM
                             // command below.
@@ -81,6 +83,10 @@ public static partial class RemoteServerWiring
                                         && double.TryParse(parts[1], num, inv, out var lon))
                                         vm.SetSimulatorCoordinates(lat, lon);
                                     return;
+                                case "section.toggleZone": // Tier-2 (gated); arg = zone 1..8 (#111)
+                                    if (int.TryParse(arg, System.Globalization.NumberStyles.Integer, inv, out var zi))
+                                        vm.ToggleZone(zi);
+                                    return;
                                 case "section.toggle": // Tier-2 (gated); cycle one section
                                     if (int.TryParse(arg, System.Globalization.NumberStyles.Integer, inv, out var si)
                                         && vm.ToggleSectionCommand?.CanExecute(si) == true)
@@ -97,16 +103,30 @@ public static partial class RemoteServerWiring
                                     if (double.TryParse(arg, num, inv, out var capMult)) // (2.5 = Medium)
                                         vm.CapDisplayResolution(capMult); // only coarsens; idempotent
                                     return;
-                                case "view.save": // web camera tilt+zoom persisted host-side (issue #35).
-                                {                 // arg = "pitch|zoom" (pitch radians, zoom px/m). Tier-1.
+                                case "view.save": // web camera tilt+zoom (+ follow mode, #176) persisted host-side (issue #35).
+                                {                 // arg = "pitch|zoom[|mode]" (pitch radians, zoom px/m, client mode). Tier-1.
                                     var vparts = arg.Split('|');
-                                    if (vparts.Length == 2
+                                    if (vparts.Length is 2 or 3
                                         && double.TryParse(vparts[0], num, inv, out var vpitch)
                                         && double.TryParse(vparts[1], num, inv, out var vzoom))
                                     {
                                         var ps = services.GetRequiredService<IPersistentStateService>();
                                         ps.State.WebCameraPitch = vpitch;
                                         ps.State.WebCameraZoom = vzoom;
+                                        // Client numbering (0 N, 1 H, 2 Free, 3 Map) differs from the
+                                        // enum's (Map=2, Free=3): map explicitly. Free (a temporary
+                                        // "I panned" state) is never saved.
+                                        if (vparts.Length == 3 && int.TryParse(vparts[2], out var vmode))
+                                        {
+                                            AgOpenWeb.Models.CameraMode? cm = vmode switch
+                                            {
+                                                0 => AgOpenWeb.Models.CameraMode.NorthUp,
+                                                1 => AgOpenWeb.Models.CameraMode.HeadingUp,
+                                                3 => AgOpenWeb.Models.CameraMode.Map,
+                                                _ => null,
+                                            };
+                                            if (cm is { } m) ps.State.CameraMode = m;
+                                        }
                                         ps.Save();
                                     }
                                     return;
@@ -120,8 +140,14 @@ public static partial class RemoteServerWiring
                                     var rollStore = services.GetRequiredService<AgOpenWeb.Models.Configuration.ConfigurationStore>();
                                     var rollState = services.GetRequiredService<AgOpenWeb.Models.State.ApplicationState>();
                                     rollStore.Ahrs.RollZero += rollState.Vehicle.Roll;
+                                    var cfg = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IConfigurationService>();
+                                    cfg.SaveProfiles(rollStore.ActiveVehicleProfileName, rollStore.ActiveToolProfileName);
                                     return;
                                 }
+                                case "heading.resetDirection": // tap on the vehicle (AgOpenGPS "Reset Direction");
+                                    // Tier-2: it changes the heading the steering uses.
+                                    services.GetRequiredService<AgOpenWeb.Services.Interfaces.IGpsHeadingFusionService>().ResetDirection();
+                                    return;
                                 case "field.deleteApplied": // Tier-1; browser already confirmed
                                     vm.DeleteAppliedAreaConfirmed();
                                     return;
@@ -133,10 +159,10 @@ public static partial class RemoteServerWiring
                                     vm.RecordedPathName = arg;
                                     vm.SaveNamedRecordedPathCommand?.Execute(null);
                                     return;
-                                case "recpath.selectFile": // arg = .rec file name → load for playback (Tier-1)
+                                case "recpath.selectFile": // arg = saved path name → load for playback (Tier-1)
                                     vm.SelectedRecFile = arg;
                                     return;
-                                case "recpath.delete": // arg = .rec file name (Tier-1; browser confirmed)
+                                case "recpath.delete": // arg = saved path name (Tier-1; browser confirmed)
                                     if (vm.DeleteRecordedPathCommand?.CanExecute(arg) == true)
                                         vm.DeleteRecordedPathCommand.Execute(arg);
                                     return;
@@ -152,23 +178,27 @@ public static partial class RemoteServerWiring
                                 case "boundary.toggleSectionControl": // ToggleButton has no command (Tier-1)
                                     vm.IsBoundarySectionControlOn = !vm.IsBoundarySectionControlOn;
                                     return;
-                                case "track.rename": // Field Builder. arg = "index,new name". Tier-2.
+                                case "track.rename": // Field Builder. arg = "index,new name". Ungated (field data, #111).
                                 {
                                     var ri = arg.IndexOf(',');
                                     if (ri > 0 && int.TryParse(arg[..ri], out var rti))
                                         vm.RenameTrackAt(rti, arg[(ri + 1)..]);
                                     return;
                                 }
-                                case "track.select": // Tracks manager — tap a row. arg = index.
-                                {                    // Mirrors native: tapping the active track
-                                    if (int.TryParse(arg, out var tsi) // deactivates; else activates.
-                                        && tsi >= 0 && tsi < vm.SavedTracks.Count)
-                                    {
-                                        var t = vm.SavedTracks[tsi];
-                                        vm.SelectedTrack = vm.SelectedTrack == t ? null : t;
-                                    }
+                                case "track.select": // Tracks manager / Field Builder — tap a row:
+                                {                    // that track becomes active (#148). arg = index.
+                                    if (int.TryParse(arg, out var tsi)) vm.SelectTrackAt(tsi);
                                     return;
                                 }
+                                case "track.delete": // Tracks manager / Field Builder. arg = highlighted index (#109).
+                                    vm.DeleteTrackAt(int.TryParse(arg, out var tdel) ? tdel : -1);
+                                    return;
+                                case "track.swapAB": // Tracks manager. arg = highlighted index (#109).
+                                    vm.SwapTrackABAt(int.TryParse(arg, out var tswi) ? tswi : -1);
+                                    return;
+                                case "track.activate": // Tracks manager Activate (AgOpenGPS "Use"). arg = highlighted
+                                    vm.ActivateTrackAt(int.TryParse(arg, out var tai) ? tai : -1); // index, or -1 (#109).
+                                    return;
                                 case "track.setVisible": // arg = "index,0|1" — show/hide on map.
                                 {
                                     var vp = arg.Split(',');
@@ -333,6 +363,16 @@ public static partial class RemoteServerWiring
                                 case "flag.delete":
                                     if (int.TryParse(arg, out var fdi)) vm.DeleteFlagAt(fdi);
                                     return;
+                                case "track.deleteAll": // Field Builder; browser already confirmed (#109)
+                                    vm.DeleteAllTracksConfirmed();
+                                    return;
+                                case "prompt.answer": // arg = "seq,yes(1|0),checkbox(1|0)" — answers the
+                                {                     // host's pending confirm/error (#109). Gated.
+                                    var pa = arg.Split(',');
+                                    if (pa.Length == 3 && int.TryParse(pa[0], out var pseq))
+                                        vm.AnswerPrompt(pseq, pa[1] == "1", pa[2] == "1");
+                                    return;
+                                }
                                 case "flag.deleteAll":
                                     vm.DeleteAllFlagsRemote();
                                     return;
@@ -474,7 +514,7 @@ public static partial class RemoteServerWiring
                                     ApplyNtripCommand(
                                         services.GetRequiredService<INtripProfileService>(),
                                         services.GetRequiredService<AgOpenWeb.Models.State.ApplicationState>(),
-                                        dispatcher, cmd, arg);
+                                        dispatcher, cmd, arg, vm);
                                     return;
                                 // --- Field Operations (Phase 9). Lifecycle routes through the real
                                 // StartWorkSessionDialogViewModel (host-driven) so field/job open/
@@ -487,6 +527,7 @@ public static partial class RemoteServerWiring
                                     return;
                                 case "field.resumeLast": ExecCmd(vm.ResumeLastJobCommand); return;
                                 case "field.driveIn": ExecCmd(vm.DriveInCommand); return;
+                                case "field.driveInOpen": vm.DriveInOpen(arg); return; // pick-list choice (#109)
                                 case "field.close": ExecCmd(vm.CloseFieldCommand); return;
                                 // Unsaved-coverage guard resolution (the web prompt mirrors the
                                 // host's DialogType.UnsavedCoverage). Save creates a job then
@@ -529,6 +570,7 @@ public static partial class RemoteServerWiring
                                 "sim.reverseDir" => vm.SimulatorReverseDirectionCommand,
                                 // Right-nav operational toolbar (Tier-2).
                                 "contour.toggle" => vm.ToggleContourModeCommand,
+                                "contour.lock" => vm.ToggleContourLockCommand, // #110
                                 "section.master" => vm.ToggleSectionMasterCommand,
                                 "section.manual" => vm.ToggleManualModeCommand,
                                 "youturn.toggle" => vm.ToggleYouTurnCommand,
@@ -560,6 +602,10 @@ public static partial class RemoteServerWiring
                                 "track.halfNudgeLeft" => vm.HalfToolNudgeLeftCommand,
                                 "track.halfNudgeRight" => vm.HalfToolNudgeRightCommand,
                                 "track.resetNudge" => vm.ResetNudgeCommand,
+                                "track.extendA" => vm.ExtendTrackACommand,
+                                "track.extendB" => vm.ExtendTrackBCommand,
+                                "track.shrinkA" => vm.ShrinkTrackACommand,
+                                "track.shrinkB" => vm.ShrinkTrackBCommand,
                                 "track.cycle" => vm.CycleABLinesCommand,
                                 "track.smooth" => vm.SmoothABLineCommand,
                                 "track.deleteContours" => vm.DeleteContoursCommand,
@@ -577,7 +623,7 @@ public static partial class RemoteServerWiring
                                 "track.aPlus" => vm.StartAPlusLineCommand,
                                 "track.boundaryCurve" => vm.CreateCurveFromBoundaryCommand,
                                 "track.allEdges" => vm.CreateTracksFromAllEdgesCommand,
-                                "track.deleteAll" => vm.DeleteAllTracksCommand, // Field Builder
+
                                 // Quick-AB selector (GPS-driven): drive A→B, record a curve
                                 // by driving, and set-point-at-vehicle (param ignored in
                                 // DriveAB/Curve modes → uses live GPS).
@@ -586,9 +632,6 @@ public static partial class RemoteServerWiring
                                 "track.finishCurve" => vm.FinishCurveRecordingCommand,
                                 "track.setABGps" => vm.SetABPointCommand,
                                 // Tracks manager toolbar (act on the active/selected track).
-                                "track.delete" => vm.DeleteContourTrackCommand,
-                                "track.swapAB" => vm.SwapABPointsCommand,
-                                "track.activate" => vm.SelectTrackAsActiveCommand,
                                 "track.toggleRecPaths" => vm.ToggleRecordedPathsCommand,
                                 // Field Tools — Recorded Path. Record/save/select are Tier-1
                                 // (data); recpath.play drives the vehicle → Tier-2 (gated below).
@@ -607,7 +650,6 @@ public static partial class RemoteServerWiring
                                 "boundary.buildFromTracks" => vm.BuildFromTracksCommand,
                                 "boundary.driveAround" => vm.DriveAroundFieldCommand,
                                 "boundary.driveAroundInner" => vm.DriveAroundInnerBoundaryCommand,
-                                "boundary.accept" => vm.ToggleBoundaryPanelCommand,
                                 // Player (drive-around recording):
                                 "boundary.clear" => vm.ClearBoundaryCommand,
                                 "boundary.undo" => vm.UndoBoundaryPointCommand,
@@ -636,7 +678,9 @@ public static partial class RemoteServerWiring
                         || (id.StartsWith("headland.") && !UngatedHeadlandIds.Contains(id))
                         || id.StartsWith("smartwas.") || id.StartsWith("wizard.action")
                         || id == "net.subnet" // restarts every module → gate it
-                        || id == "recpath.play"; // drives the vehicle along the path → actuation
+                        || id == "prompt.answer" // a confirm can delete data or restart modules
+                        || id == "recpath.play" // drives the vehicle along the path → actuation
+                        || id == "heading.resetDirection"; // changes the heading the steering uses
 
                     // One operator, via the browser. When the control session ends —
                     // release, disconnect, or deadman — the machine must not keep
@@ -676,16 +720,52 @@ public static partial class RemoteServerWiring
                         wizardActive && vm.SteerWizardViewModel is { } w
                             ? BuildWizardDto(w) : null;
 
+                    // Pending confirm/error projector (#109): the host's ShowConfirmationDialog /
+                    // ShowErrorDialog used to open a native overlay the web never saw, so the
+                    // action waited forever (or the error was invisible). The browser holding
+                    // control answers via prompt.answer. Read-only on the broadcaster thread.
+                    server.PromptProvider = () =>
+                    {
+                        if (!vm.IsPromptPending) return AgOpenWeb.RemoteServer.PromptDto.None;
+                        bool isError = vm.State.UI.ActiveDialog == AgOpenWeb.Models.State.DialogType.Error;
+                        return isError
+                            ? new AgOpenWeb.RemoteServer.PromptDto(vm.PromptSeq, 2,
+                                vm.ErrorDialogTitle ?? "", vm.ErrorDialogMessage ?? "", "", "", "", false)
+                            : new AgOpenWeb.RemoteServer.PromptDto(vm.PromptSeq, 1,
+                                vm.ConfirmationDialogTitle ?? "", vm.ConfirmationDialogMessage ?? "",
+                                vm.ConfirmationDialogConfirmLabel ?? "", vm.ConfirmationDialogCancelLabel ?? "",
+                                vm.ConfirmationDialogCheckboxLabel ?? "", vm.ConfirmationDialogCheckboxChecked);
+                    };
+
+                    // Refusals and failures (#109): shown as a short notification on the web.
+                    vm.FailureReported += msg => server.ShowToast(msg);
+
+                    // AiO board messages (PGN 221), when "AiO Board Msgs" is on (#110).
+                    if (services.GetService<IAutoSteerService>() is { } hwSteer)
+                    {
+                        var hwStore = services.GetRequiredService<AgOpenWeb.Models.Configuration.ConfigurationStore>();
+                        hwSteer.HardwareMessageReceived += (text, secs, warn) =>
+                        {
+                            if (hwStore.Display.HardwareMessagesEnabled) server.ShowHardwareMessage(text, secs, warn);
+                        };
+                    }
+
+                    // Drive In found 2+ nearby fields (#109): offer them as a pick list.
+                    vm.DriveInPickRequested += nearby => server.ShowDrivePick(nearby
+                        .Select(f => new AgOpenWeb.RemoteServer.FieldEntryDto(
+                            f.Name, true, f.DistanceKm, f.BoundaryAreaHectares))
+                        .ToList());
+
                     // Recorded Path projector: the panel's UI state (IsRecordingPath,
                     // HasUnsaved, info/label) is VM-owned, so project it from the live VM
-                    // each tick; the .rec file list comes off disk. Read-only on the
+                    // each tick; the saved-path names come off disk (cached until it changes). Read-only on the
                     // broadcaster thread, same race tolerance as the other projectors.
                     server.RecordedPathProvider = () =>
                     {
                         var dir = services.GetRequiredService<AgOpenWeb.Services.IFieldService>()
                             .ActiveField?.DirectoryPath;
                         var recFiles = !string.IsNullOrEmpty(dir)
-                            ? AgOpenWeb.Services.RecPathFileService.ListRecFiles(dir)
+                            ? AgOpenWeb.Services.GeoJson.GeoJsonFieldService.ListRecordedPaths(dir)
                             : new System.Collections.Generic.List<string>();
                         var st = services.GetRequiredService<AgOpenWeb.Models.State.ApplicationState>();
                         var live = vm.LiveRecordingPoints;
@@ -713,7 +793,7 @@ public static partial class RemoteServerWiring
                         var items = new System.Collections.Generic.List<AgOpenWeb.RemoteServer.BoundaryItemDto>();
                         foreach (var it in vm.BoundaryItems)
                             items.Add(new AgOpenWeb.RemoteServer.BoundaryItemDto(
-                                it.Index, it.BoundaryType, it.AreaDisplay, it.IsDriveThrough, it.IsHard));
+                                it.Index, it.BoundaryType, it.AreaHectares, it.IsDriveThrough, it.IsHard));
                         var bpts = new System.Collections.Generic.List<double>(brs.RecordedPoints.Count * 2);
                         foreach (var p in brs.RecordedPoints) { bpts.Add(p.Easting); bpts.Add(p.Northing); }
                         return new AgOpenWeb.RemoteServer.BoundaryDto(
@@ -737,13 +817,63 @@ public static partial class RemoteServerWiring
                     server.ViewPrefsProvider = () =>
                     {
                         var st = services.GetRequiredService<IPersistentStateService>().State;
-                        return (st.WebCameraPitch, st.WebCameraZoom);
+                        int webMode = st.CameraMode switch
+                        {
+                            AgOpenWeb.Models.CameraMode.NorthUp => 0,
+                            AgOpenWeb.Models.CameraMode.HeadingUp => 1,
+                            _ => 3, // Map; Free is never restored (#176)
+                        };
+                        return (st.WebCameraPitch, st.WebCameraZoom, webMode);
                     };
 
                     // Field Builder Headland-tab list: the segments live on the VM
                     // (MainViewModel.HeadlandSegments — no ApplicationState SoT), so project
                     // them from the live VM each tick. Read-only on the broadcaster thread,
                     // same transient-race tolerance as the other VM-coupled projectors.
+                    // Heading chart (#111): like AgOpenGPS FormGraphHeading, GPS fix-to-fix vs
+                    // IMU-corrected heading, straight from the heading stage.
+                    var headingFusion = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IGpsHeadingFusionService>();
+                    server.HeadingChartProvider = () => (headingFusion.GpsHeadingDeg, headingFusion.ImuCorrectedDeg);
+
+                    // GPS source (#157): the incoming sentence for the GPS detail card, and
+                    // "Dual GPS on but no dual heading" while real GPS is live ($PANDA with
+                    // Dual on: the heading stage falls back to the single-antenna heading).
+                    var gpsSvc = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IGpsService>();
+                    server.GpsSourceProvider = () =>
+                    {
+                        var sentence = gpsSvc.CurrentData?.SentenceType switch
+                        {
+                            AgOpenWeb.Models.GpsSentenceType.Panda => "PANDA",
+                            AgOpenWeb.Models.GpsSentenceType.Paogi => "PAOGI",
+                            AgOpenWeb.Models.GpsSentenceType.Simulator => "SIM",
+                            _ => "",
+                        };
+                        return (sentence, headingFusion.IsDualHeadingMissing && gpsSvc.IsGpsLive);
+                    };
+
+                    // System Data card (Network IO → GPS): like AgIO's and AgOpenGPS's
+                    // "System Data" forms — attitude, each heading source before fusion,
+                    // the sentence rate and the module's latest raw sentences.
+                    var steerSvc = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IAutoSteerService>();
+                    server.SystemDataProvider = () =>
+                    {
+                        var d = gpsSvc.CurrentData;
+                        if (d == null) return null;
+                        var raw = steerSvc.GpsSentences.GetSnapshot();
+                        var sentences = new System.Collections.Generic.List<AgOpenWeb.RemoteServer.GpsSentenceDto>(raw.Sentences.Count);
+                        foreach (var s in raw.Sentences)
+                            sentences.Add(new AgOpenWeb.RemoteServer.GpsSentenceDto(s.Type, s.Text, s.AgeSeconds));
+                        return new AgOpenWeb.RemoteServer.SystemDataDto(
+                            d.ImuPitch, d.ImuYawRate,
+                            d.ImuValid ? d.ImuHeading : double.NaN,
+                            // The simulator's heading is flagged dual so the fusion takes it as is;
+                            // it isn't an antenna reading.
+                            d.HasDualHeading && d.SentenceType != AgOpenWeb.Models.GpsSentenceType.Simulator
+                                ? d.CurrentPosition.Heading : double.NaN,
+                            headingFusion.GpsHeadingDeg,
+                            raw.RateHz, raw.Missed, raw.Rejected, sentences);
+                    };
+
                     server.HeadlandSegsProvider = () =>
                     {
                         var segs = vm.HeadlandSegments;
@@ -778,10 +908,18 @@ public static partial class RemoteServerWiring
                             foreach (var p in line) pl.Add(new AgOpenWeb.RemoteServer.Vec2Dto(p.Easting, p.Northing));
                             outLines.Add(pl);
                         }
-                        Add(tramSvc.OuterBoundaryTrack);
-                        Add(tramSvc.InnerBoundaryTrack);
-                        foreach (var line in tramSvc.ParallelTramLines) Add(line);
-                        foreach (var line in tramSvc.BoundaryExtraLines) Add(line);
+                        // Display mode (#111): All, Lines only (parallel) or Outer only
+                        // (boundary tracks) — AgOpenGPS tram.displayMode. Off is gated client-side.
+                        var mode = services.GetRequiredService<AgOpenWeb.Models.Configuration.ConfigurationStore>().Tram.DisplayMode;
+                        bool bnd = mode != AgOpenWeb.Models.Configuration.TramDisplayMode.LinesOnly;
+                        bool par = mode != AgOpenWeb.Models.Configuration.TramDisplayMode.OuterOnly;
+                        if (bnd)
+                        {
+                            Add(tramSvc.OuterBoundaryTrack);
+                            Add(tramSvc.InnerBoundaryTrack);
+                            foreach (var line in tramSvc.BoundaryExtraLines) Add(line);
+                        }
+                        if (par) foreach (var line in tramSvc.ParallelTramLines) Add(line);
                         return outLines;
                     };
     }

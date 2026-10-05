@@ -39,6 +39,29 @@ public sealed class RemoteServerHost
     public void PlaySound(AgOpenWeb.Services.Interfaces.SoundEffect effect)
         => _ = _ws?.BroadcastAsync(WireCodec.EncodeSound((byte)effect));
 
+    /// <summary>Broadcast a one-shot notification (a refusal or failure, #109) to every
+    /// connected client.</summary>
+    public void ShowToast(string message)
+        => _ = _ws?.BroadcastAsync(WireCodec.EncodeToast(message));
+
+    /// <summary>Broadcast a module hardware message (PGN 221, #110).</summary>
+    public void ShowHardwareMessage(string text, int seconds, bool warning)
+        => _ = _ws?.BroadcastAsync(WireCodec.EncodeHardwareMessage(text, seconds, warning));
+
+    /// <summary>Broadcast the Drive In pick list (#109). The browser that pressed Drive In
+    /// shows it.</summary>
+    public void ShowDrivePick(IReadOnlyList<FieldEntryDto> fields)
+        => _ = _ws?.BroadcastAsync(WireCodec.EncodeDrivePick(fields));
+
+    /// <summary>Host-supplied projector for the pending confirm/error dialog (#109).
+    /// Read every broadcast tick. Set after <see cref="StartAsync"/>.</summary>
+    public Func<PromptDto?>? PromptProvider
+    {
+        get => _broadcaster?.PromptProvider;
+        set { _promptProvider = value; if (_broadcaster is not null) _broadcaster.PromptProvider = value; }
+    }
+    private Func<PromptDto?>? _promptProvider;
+
     // Satellite tile fetch (Phase MT — Draw boundary on map). Keyless Bing aerial
     // tiles via the Virtual Earth quadkey endpoint (same source as native's
     // BoundaryMapDialog). Proxied through the host so the browser draws them into the
@@ -92,15 +115,40 @@ public sealed class RemoteServerHost
     /// <summary>Host-supplied persisted web-camera view (pitch radians, zoom px/m).
     /// Read once per connection and sent in the seed so the client restores its last
     /// tilt+zoom (issue #35). Set after <see cref="StartAsync"/>.</summary>
-    public Func<(double Pitch, double Zoom)?>? ViewPrefsProvider
+    public Func<(double Pitch, double Zoom, int CameraMode)?>? ViewPrefsProvider
     {
         get => _broadcaster?.ViewPrefsProvider;
         set { _viewPrefsProvider = value; if (_broadcaster is not null) _broadcaster.ViewPrefsProvider = value; }
     }
-    private Func<(double Pitch, double Zoom)?>? _viewPrefsProvider;
+    private Func<(double Pitch, double Zoom, int CameraMode)?>? _viewPrefsProvider;
 
     /// <summary>Host-supplied projector for the Field Builder Headland-tab segment list
     /// (VM-owned, rides the Scene frame). Set after <see cref="StartAsync"/>.</summary>
+    /// <summary>Heading chart source: GPS fix-to-fix and IMU-corrected heading (#111).</summary>
+    public Func<(double Gps, double Imu)>? HeadingChartProvider
+    {
+        get => _broadcaster?.Projector.HeadingChartProvider;
+        set { _headingChartProvider = value; if (_broadcaster is not null) _broadcaster.Projector.HeadingChartProvider = value; }
+    }
+    private Func<(double Gps, double Imu)>? _headingChartProvider;
+
+    /// <summary>GPS source for the status frame: sentence type and whether Dual GPS is
+    /// on without a dual-antenna heading (#157).</summary>
+    public Func<(string Sentence, bool DualHeadingMissing)>? GpsSourceProvider
+    {
+        get => _broadcaster?.Projector.GpsSourceProvider;
+        set { _gpsSourceProvider = value; if (_broadcaster is not null) _broadcaster.Projector.GpsSourceProvider = value; }
+    }
+    private Func<(string Sentence, bool DualHeadingMissing)>? _gpsSourceProvider;
+
+    /// <summary>GPS values for the System Data card (Network IO → GPS).</summary>
+    public Func<SystemDataDto?>? SystemDataProvider
+    {
+        get => _broadcaster?.Projector.SystemDataProvider;
+        set { _systemDataProvider = value; if (_broadcaster is not null) _broadcaster.Projector.SystemDataProvider = value; }
+    }
+    private Func<SystemDataDto?>? _systemDataProvider;
+
     public Func<IReadOnlyList<HeadlandSegInfoDto>>? HeadlandSegsProvider
     {
         get => _broadcaster?.Projector.HeadlandSegsProvider;
@@ -155,7 +203,8 @@ public sealed class RemoteServerHost
         IJobService jobs, IConfigurationService configService, IAutoSteerService autoSteer,
         ISmartWasCalibrationService smartWas, IUdpCommunicationService udp,
         INtripProfileService ntripProfiles, IFieldService fields, ISettingsService settings,
-        IVehicleProfileService vehicleProfiles, IPersistentStateService persist, int port = 5174)
+        IVehicleProfileService vehicleProfiles, IPersistentStateService persist,
+        INtripClientService? ntrip = null, int port = 5174)
     {
         Port = port;
 
@@ -165,7 +214,7 @@ public sealed class RemoteServerHost
         var authority = new ControlAuthority();
         var sceneProjector = new SceneProjector(state, sections, tool, config, coverage, jobs,
             configService, autoSteer, smartWas, udp, ntripProfiles, fields, settings,
-            vehicleProfiles, persist);
+            vehicleProfiles, persist, ntrip);
         var coverageProjector = new CoverageProjector(coverage);
         _ws = new WebSocketHub(authority);
         _broadcaster = new MapBroadcaster(_ws, sceneProjector, coverage, coverageProjector, authority);
@@ -175,10 +224,14 @@ public sealed class RemoteServerHost
         _ws.CommandHandler = _commandHandler;
         _ws.IsRestrictedCommand = _isRestricted;
         _broadcaster.WizardProvider = _wizardProvider;
+        _broadcaster.PromptProvider = _promptProvider;
         _broadcaster.RecordedPathProvider = _recordedPathProvider;
         _broadcaster.BoundaryProvider = _boundaryProvider;
         _broadcaster.ViewPrefsProvider = _viewPrefsProvider;
         _broadcaster.Projector.HeadlandSegsProvider = _headlandSegsProvider;
+        _broadcaster.Projector.HeadingChartProvider = _headingChartProvider;
+        _broadcaster.Projector.GpsSourceProvider = _gpsSourceProvider;
+        _broadcaster.Projector.SystemDataProvider = _systemDataProvider;
         _broadcaster.Projector.TramLinesProvider = _tramLinesProvider;
 
         // Control authority → broadcast state to clients + drive the native banner;
@@ -204,6 +257,17 @@ public sealed class RemoteServerHost
         server.MapGet("/", () => SimpleWebServer.Response.Text(ReadAsset("index.html"), "text/html", noStore));
         server.MapGet("/app.js", () => SimpleWebServer.Response.Text(ReadAsset("app.js"), "text/javascript", noStore));
         server.MapGet("/transport.js", () => SimpleWebServer.Response.Text(ReadAsset("transport.js"), "text/javascript", noStore));
+        // Translations (#143): the loader, and one JSON file per language (en.json is the
+        // source Weblate reads). Filename-only (no path traversal); unknown names 404.
+        server.MapGet("/i18n.js", () => SimpleWebServer.Response.Text(ReadAsset("i18n.js"), "text/javascript", noStore));
+        server.MapGetPrefix("/i18n/", file =>
+        {
+            if (file.Contains('/') || file.Contains('\\') || file.Contains("..")
+                || !file.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                return SimpleWebServer.Response.NotFound;
+            try { return SimpleWebServer.Response.Text(ReadAsset("i18n." + file), "application/json", noStore); }
+            catch (FileNotFoundException) { return SimpleWebServer.Response.NotFound; }
+        });
         // PWA manifest — lets "Add to home screen" launch fullscreen (no browser chrome).
         server.MapGet("/manifest.webmanifest", () => SimpleWebServer.Response.Text(ReadAsset("manifest.webmanifest"), "application/manifest+json"));
 
@@ -259,6 +323,23 @@ public sealed class RemoteServerHost
             if (bytes is null) return SimpleWebServer.Response.NotFound;
             return SimpleWebServer.Response.Bytes(bytes, "image/jpeg",
                 new[] { ("Cache-Control", "public, max-age=604800") }); // a week
+        });
+
+        // Bug report zips, as a download: the report is made on the host, and this is how it
+        // reaches the device in the user's hand, where the browser saves it to Downloads.
+        // Filename-only (no path traversal), and only the reports the app wrote.
+        server.MapGetPrefix("/bugreports/", file =>
+        {
+            if (file.Contains('/') || file.Contains('\\') || file.Contains("..")
+                || !file.StartsWith("bugreport_", StringComparison.Ordinal)
+                || !file.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                return SimpleWebServer.Response.NotFound;
+            var path = Path.Combine(AgOpenWeb.Services.AppDataRoot.Documents, "BugReports", file);
+            if (!File.Exists(path)) return SimpleWebServer.Response.NotFound;
+            return SimpleWebServer.Response.Bytes(File.ReadAllBytes(path), "application/zip",
+                // No filename in the header: the browser takes it from the URL, which carries
+                // non-ASCII titles intact.
+                new[] { ("Content-Disposition", "attachment"), ("Cache-Control", "no-store") });
         });
 
         await server.StartAsync().ConfigureAwait(false);

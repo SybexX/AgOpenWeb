@@ -26,13 +26,13 @@ namespace AgOpenWeb.Models.State;
 /// Every property is written on the UI thread. No service writes here
 /// directly — communication services (<c>NtripClientService</c>,
 /// <c>UdpCommunicationService</c>) raise events from their own background
-/// threads; the ViewModel's handlers check
-/// <c>Dispatcher.UIThread.CheckAccess()</c> and <c>Post</c> if needed
-/// before touching <c>State.Connections</c>. The hello-timer polling
-/// in <c>MainViewModel</c> starts on the UI thread and its <c>await</c>
-/// continuations stay on the UI thread via Avalonia's
-/// <c>SynchronizationContext</c>, so <c>State.Connections</c> writes
-/// there are also UI-thread.
+/// threads; the ViewModel's handlers check the injected
+/// <c>IUiDispatcher</c>'s <c>CheckAccess()</c> and <c>Post</c> if needed
+/// before touching <c>State.Connections</c>. Exception: the hello-timer polling
+/// in <c>MainViewModel</c> starts on the host-loop thread, but the
+/// <c>HostLoopDispatcher</c> installs no <c>SynchronizationContext</c>, so after
+/// its first <c>await</c> it writes <c>State.Connections</c> from thread-pool
+/// threads. (Under the old Avalonia UI thread those continuations stayed on it.)
 /// </para>
 ///
 /// <para>Reader / writer table:</para>
@@ -96,6 +96,22 @@ public class ConnectionState : ObservableObject
         set => SetProperty(ref _ntripBytesReceived, value);
     }
 
+    // Where RTCM is being sent (empty with no session), and whether that is the GPS
+    // module's own address rather than the subnet broadcast.
+    private string _ntripRtcmDestination = "";
+    public string NtripRtcmDestination
+    {
+        get => _ntripRtcmDestination;
+        set => SetProperty(ref _ntripRtcmDestination, value);
+    }
+
+    private bool _ntripRtcmUnicast;
+    public bool NtripRtcmUnicast
+    {
+        get => _ntripRtcmUnicast;
+        set => SetProperty(ref _ntripRtcmUnicast, value);
+    }
+
     // Result of the most recent NTRIP "Test Connection" probe (e.g. from the remote
     // Network IO editor). Set on the UI thread by the test runner; projected on the
     // Status frame so the browser editor can show it. Empty = no test run.
@@ -119,6 +135,16 @@ public class ConnectionState : ObservableObject
     {
         get => _isAutoSteerDataOk;
         set => SetProperty(ref _isAutoSteerDataOk, value);
+    }
+
+    /// <summary>AutoSteer is engaged but the steer module reports it isn't steering
+    /// (PGN 253 steer bit high: sensor kickout, switch off, button). AgOpenGPS turns
+    /// the steer circle red for this (#126).</summary>
+    private bool _isModuleNotSteering;
+    public bool IsModuleNotSteering
+    {
+        get => _isModuleNotSteering;
+        set => SetProperty(ref _isModuleNotSteering, value);
     }
 
     private bool _isAutoSteerEngaged;
@@ -211,6 +237,8 @@ public class ConnectionState : ObservableObject
         IsNtripConnected = false;
         NtripStatus = "Not Connected";
         NtripBytesReceived = 0;
+        NtripRtcmDestination = "";
+        NtripRtcmUnicast = false;
         IsAutoSteerConnected = IsAutoSteerDataOk = IsAutoSteerEngaged = false;
         IsMachineConnected = IsMachineDataOk = false;
         IsImuConnected = IsImuDataOk = false;

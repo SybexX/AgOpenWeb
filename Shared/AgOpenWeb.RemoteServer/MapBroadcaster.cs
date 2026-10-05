@@ -44,12 +44,15 @@ public sealed class MapBroadcaster : IAsyncDisposable
     // host projects it (like the wizard). Read every tick, re-sent on a fingerprint change.
     public Func<RecordedPathDto?>? RecordedPathProvider { get; set; }
     private long _lastRecPathFp = long.MinValue;
+    // Host-driven pending confirm/error dialog (#109). Read every tick, re-sent on change.
+    public Func<PromptDto?>? PromptProvider { get; set; }
+    private PromptDto _lastPrompt = PromptDto.None;
     // Host-driven Boundary read-frame (menu list + live drive-around recording state).
     public Func<BoundaryDto?>? BoundaryProvider { get; set; }
     private long _lastBoundaryFp = long.MinValue;
     // Host-supplied persisted web-camera view (pitch radians, zoom px/m). Read once
     // per connection and sent in the seed so the client restores its last tilt+zoom.
-    public Func<(double Pitch, double Zoom)?>? ViewPrefsProvider { get; set; }
+    public Func<(double Pitch, double Zoom, int CameraMode)?>? ViewPrefsProvider { get; set; }
     private volatile bool _coverageInitSent;
     private double _lastCellSize;
     // Last coverage grid announced to clients (origin + dims). A change here with the SAME cell
@@ -94,9 +97,10 @@ public sealed class MapBroadcaster : IAsyncDisposable
             WireCodec.EncodeRecordedPath(RecordedPathProvider?.Invoke() ?? EmptyRecordedPath),
             WireCodec.EncodeBoundary(BoundaryProvider?.Invoke() ?? EmptyBoundary),
             WireCodec.EncodeControlState(_authority.Snapshot()),
+            WireCodec.EncodePrompt(PromptProvider?.Invoke() ?? PromptDto.None),
         };
         if (ViewPrefsProvider?.Invoke() is { } vp)
-            frames.Add(WireCodec.EncodeViewPrefs(vp.Pitch, vp.Zoom));
+            frames.Add(WireCodec.EncodeViewPrefs(vp.Pitch, vp.Zoom, vp.CameraMode));
         if (_coverageProjector.BuildInit() is { } init)
         {
             frames.Add(WireCodec.EncodeCoverageInit(init, reset: true)); // fresh client → rebuild from the seed snapshot
@@ -225,6 +229,14 @@ public sealed class MapBroadcaster : IAsyncDisposable
                         _lastBoundaryFp = bfp;
                         await _ws.BroadcastAsync(WireCodec.EncodeBoundary(bDto), ct).ConfigureAwait(false);
                     }
+                }
+
+                // Pending confirm/error prompt (host-driven, #109). Records compare by value.
+                var prompt = PromptProvider?.Invoke() ?? PromptDto.None;
+                if (prompt != _lastPrompt)
+                {
+                    _lastPrompt = prompt;
+                    await _ws.BroadcastAsync(WireCodec.EncodePrompt(prompt), ct).ConfigureAwait(false);
                 }
 
                 await _ws.BroadcastAsync(WireCodec.EncodeTick(_projector.BuildTick(_sceneVersion)), ct)
@@ -373,7 +385,7 @@ public sealed class MapBroadcaster : IAsyncDisposable
         {
             h = h * 31 + it.Index;
             h = h * 31 + (it.BoundaryType?.GetHashCode() ?? 0);
-            h = h * 31 + (it.AreaDisplay?.GetHashCode() ?? 0);
+            h = h * 31 + it.AreaHa.GetHashCode();
             h = h * 31 + (it.DriveThru ? 1 : 0);
             h = h * 31 + (it.Hard ? 1 : 0);
         }

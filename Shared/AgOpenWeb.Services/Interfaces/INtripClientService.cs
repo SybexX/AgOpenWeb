@@ -36,14 +36,33 @@ public interface INtripClientService
     event EventHandler<RtcmDataReceivedEventArgs>? RtcmDataReceived;
 
     /// <summary>
-    /// Whether NTRIP client is connected to caster
+    /// Whether the caster accepted the request (answered 200) and the session is open
     /// </summary>
     bool IsConnected { get; }
+
+    /// <summary>
+    /// Whether a connection was requested and not disconnected: connected, connecting,
+    /// retrying, or stopped after the caster rejected it. Use this to decide whether to
+    /// disconnect or reconnect; <see cref="IsConnected"/> is only the live state.
+    /// </summary>
+    bool IsActive { get; }
 
     /// <summary>
     /// Total bytes received from caster
     /// </summary>
     ulong TotalBytesReceived { get; }
+
+    /// <summary>
+    /// Where RTCM is being sent ("192.168.5.126" or "192.168.5.255"), empty with no session,
+    /// and whether that is the GPS module's own address (unicast) or the subnet broadcast.
+    /// </summary>
+    (string Address, bool Unicast) RtcmDestination { get; }
+
+    /// <summary>
+    /// The RTCM messages the caster has sent this session, by type, with checksum failures
+    /// and skipped bytes. Diagnostics only: counted beside the forwarder.
+    /// </summary>
+    RtcmStreamSnapshot GetRtcmStreamSnapshot();
 
     /// <summary>
     /// Connect to NTRIP caster with specified configuration
@@ -105,6 +124,25 @@ public class NtripConfiguration
     /// Subnet for UDP broadcast (e.g., "192.168.5")
     /// </summary>
     public string SubnetAddress { get; set; } = "192.168.5";
+
+    /// <summary>
+    /// The modules' live /24 (e.g. from auto-discovery), read for every RTCM send so a
+    /// subnet change is followed without reconnecting. Null, or a null/empty result,
+    /// falls back to <see cref="SubnetAddress"/>.
+    /// </summary>
+    public Func<string?>? SubnetProvider { get; set; }
+
+    /// <summary>
+    /// The GPS module's address, when known (where its position sentences come from).
+    /// RTCM is sent there; with none it is broadcast to the subnet.
+    /// </summary>
+    public Func<System.Net.IPAddress?>? GpsModuleAddressProvider { get; set; }
+
+    /// <summary>
+    /// True to broadcast RTCM to the subnet even when the GPS module's address is known.
+    /// Read for every datagram, so the setting takes effect without reconnecting.
+    /// </summary>
+    public Func<bool>? BroadcastOnly { get; set; }
 
     /// <summary>
     /// GGA send interval in seconds (0 = disabled)

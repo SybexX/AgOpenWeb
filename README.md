@@ -1,11 +1,15 @@
 # AgOpenWeb
 
-Cross-platform agricultural GPS guidance — a rewrite of [AgOpenGPS](https://github.com/farmerbriantee/AgOpenGPS) using HTML/JS, Avalonia, .NET 10, and C#. The UI is a web page served up by the backend host.
+[![CI](https://github.com/AgOpenGPS-Official/AgOpenWeb/actions/workflows/build-and-release.yml/badge.svg?branch=develop)](https://github.com/AgOpenGPS-Official/AgOpenWeb/actions/workflows/build-and-release.yml)
+[![Translation status](https://hosted.weblate.org/widget/agopengps/agopenweb/svg-badge.svg)](https://hosted.weblate.org/projects/agopengps/agopenweb/)
+
+Cross-platform agricultural GPS guidance — a rewrite of [AgOpenGPS](https://github.com/farmerbriantee/AgOpenGPS) using HTML/JS, .NET 10, and C#. The UI is a web page served up by the backend host and shown in each platform's own web view.
 
 ## Download & run
 
-Grab the latest build from the [**Releases**](../../releases) page. Everything is a
-self-contained app (no .NET install needed). Pick the set that matches how you'll run it — in
+Grab a versioned build from the [**Releases**](../../releases) page, or the
+[**Nightly**](../../releases/tag/nightly) for the newest fixes (rebuilt from `develop` daily and
+on demand; beta testers should use this one). Everything is a self-contained app (no .NET install needed). Pick the set that matches how you'll run it — in
 every mode the host also serves `http://<host>:5174` on the LAN, so cab phones/tablets connect
 in a browser.
 
@@ -44,11 +48,11 @@ WebKitGTK on Linux).
 
 ## Tech stack
 
-- **UI:** Avalonia 12
-- **MVVM:** CommunityToolkit.Mvvm
+- **UI:** HTML/JS web client with CanvasKit (Skia WebAssembly); shown in WebView2 / WKWebView / WebKitGTK on desktop (Photino.NET), WKWebView on iOS, WebView on Android
+- **Control brain:** `MainViewModel` with CommunityToolkit.Mvvm, driven by the web client
 - **Runtime:** .NET 10
-- **Architecture:** MVVM with dependency injection; ~92% shared cross-platform code
-- **Testing:** NUnit, Avalonia.Headless
+- **Architecture:** shared backend on every platform; the platform projects are thin web-view shells
+- **Testing:** NUnit, NSubstitute
 
 ## Building from source
 
@@ -73,6 +77,8 @@ packaging scripts that produce the release bundles above.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the architecture overview, feature list, and how to get
 started.
+
+To help translate the UI, no code is needed: join in on [Weblate](https://hosted.weblate.org/projects/agopengps/agopenweb/). See [Docs/TRANSLATIONS.md](Docs/TRANSLATIONS.md).
 
 ## License
 

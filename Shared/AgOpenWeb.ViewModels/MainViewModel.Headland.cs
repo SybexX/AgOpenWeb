@@ -9,6 +9,8 @@ using System.Linq;
 using AgOpenWeb.Models.Base;
 using Microsoft.Extensions.Logging;
 
+using AgOpenWeb.Services;
+
 namespace AgOpenWeb.ViewModels;
 
 /// <summary>
@@ -272,7 +274,7 @@ public partial class MainViewModel
         var bnd = State.Field.CurrentBoundary?.OuterBoundary;
         if (bnd?.Points == null || bnd.Points.Count < 3)
         {
-            StatusMessage = "No boundary for headland";
+            ReportFailure("No boundary for headland");
             return;
         }
 
@@ -901,7 +903,7 @@ public partial class MainViewModel
         {
             var fieldsDir = _settingsService.Settings.FieldsDirectory;
             if (string.IsNullOrEmpty(fieldsDir))
-                fieldsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "AgOpenWeb", "Fields");
+                fieldsDir = Path.Combine(AppDataRoot.Documents, "Fields");
             var fieldPath = Path.Combine(fieldsDir, CurrentFieldName);
             Services.Headland.HeadlandSegmentFileService.Save(fieldPath, HeadlandSegments);
         }
