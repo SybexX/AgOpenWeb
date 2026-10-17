@@ -141,6 +141,24 @@ public sealed class RemoteServerHost
     }
     private Func<(string Sentence, bool DualHeadingMissing)>? _gpsSourceProvider;
 
+    /// <summary>The ISOBUS task controller's heartbeat for the status frame (#312); null
+    /// while none is heard.</summary>
+    public Func<IsobusDto?>? IsobusProvider
+    {
+        get => _broadcaster?.Projector.IsobusProvider;
+        set { _isobusProvider = value; if (_broadcaster is not null) _broadcaster.Projector.IsobusProvider = value; }
+    }
+    private Func<IsobusDto?>? _isobusProvider;
+
+    /// <summary>The field data card's numbers for the status frame (#321); null with no
+    /// field open.</summary>
+    public Func<FieldDataDto?>? FieldDataProvider
+    {
+        get => _broadcaster?.Projector.FieldDataProvider;
+        set { _fieldDataProvider = value; if (_broadcaster is not null) _broadcaster.Projector.FieldDataProvider = value; }
+    }
+    private Func<FieldDataDto?>? _fieldDataProvider;
+
     /// <summary>GPS values for the System Data card (Network IO → GPS).</summary>
     public Func<SystemDataDto?>? SystemDataProvider
     {
@@ -231,6 +249,8 @@ public sealed class RemoteServerHost
         _broadcaster.Projector.HeadlandSegsProvider = _headlandSegsProvider;
         _broadcaster.Projector.HeadingChartProvider = _headingChartProvider;
         _broadcaster.Projector.GpsSourceProvider = _gpsSourceProvider;
+        _broadcaster.Projector.IsobusProvider = _isobusProvider;
+        _broadcaster.Projector.FieldDataProvider = _fieldDataProvider;
         _broadcaster.Projector.SystemDataProvider = _systemDataProvider;
         _broadcaster.Projector.TramLinesProvider = _tramLinesProvider;
 

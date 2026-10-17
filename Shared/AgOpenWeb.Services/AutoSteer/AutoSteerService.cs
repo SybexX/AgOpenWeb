@@ -27,7 +27,6 @@ using AgOpenWeb.Services.Interfaces;
 // Aliases to disambiguate from colliding namespaces.
 using TrackModel = AgOpenWeb.Models.Track.Track;
 using TrackInput = AgOpenWeb.Models.Track.TrackGuidanceInput;
-using ApplicationState = AgOpenWeb.Models.State.ApplicationState;
 
 namespace AgOpenWeb.Services.AutoSteer;
 
@@ -45,15 +44,13 @@ public class AutoSteerService : IAutoSteerService
     private readonly ITrackGuidanceService _guidanceService;
     private readonly IUdpCommunicationService _udpService;
     private readonly IGpsService _gpsService;
-    private readonly ApplicationState _appState;
     private readonly ConfigurationStore _configStore;
     private ITramLineService? _tramLineService;
     private ISmartWasCalibrationService? _smartWas;
 
-    // Drift compensation applied after LocalPlane → local coordinate conversion.
-    // LocalPlane itself is owned by ApplicationState.Field.LocalPlane — single shared instance
-    // across AutoSteer and the cycle worker. Created by field-open (UI thread) or by the
-    // cycle worker on first valid fix; never written here (receive thread).
+    // Drift compensation applied to the local coordinates the cycle hands over
+    // (ProcessSimulatedPosition). The WGS84 → local conversion happens in the cycle
+    // worker against the field's LocalPlane; this service never converts or holds one.
     private double _driftEasting;
     private double _driftNorthing;
 
@@ -69,6 +66,20 @@ public class AutoSteerService : IAutoSteerService
 
     /// <inheritdoc />
     public AgOpenWeb.Services.Gps.GpsSentenceMonitor GpsSentences { get; } = new();
+
+    /// <inheritdoc />
+    public AgOpenWeb.Services.Gps.NmeaLineSplitter GpsLines { get; } = new();
+
+    /// <inheritdoc />
+    public AgOpenWeb.Models.GPS.GpsSource LastGpsSource { get; private set; }
+
+    /// <inheritdoc />
+    public AgOpenWeb.Services.Gps.NmeaEpochAssembler GpsEpochs { get; } = new();
+
+    // Three GPS ports mean up to three receive threads; the parse writes _state and the
+    // splitter's tails, so one datagram is processed at a time. Uncontended on a machine
+    // with one receiver, which is all of them today.
+    private readonly object _gpsIngestLock = new();
 
     // Service state
     private bool _isEnabled;
@@ -110,13 +121,11 @@ public class AutoSteerService : IAutoSteerService
         ITrackGuidanceService guidanceService,
         IUdpCommunicationService udpService,
         IGpsService gpsService,
-        ApplicationState appState,
         ConfigurationStore configStore)
     {
         _guidanceService = guidanceService;
         _udpService = udpService;
         _gpsService = gpsService;
-        _appState = appState;
         _configStore = configStore;
 
         // Initialize state
@@ -323,7 +332,9 @@ public class AutoSteerService : IAutoSteerService
         _state.SteerSwitchActive = steerData.SteerSwitchActive;
         _state.WorkSwitchActive = steerData.WorkSwitchActive;
 
-        _smartWas?.AddSample(steerData.ActualSteerAngle);
+        // Speed and cross-track error are this service's own receive-thread state (set by
+        // ProcessSimulatedPosition and the guidance step), so the gate reads no UI mirror.
+        _smartWas?.AddSample(steerData.ActualSteerAngle, _state.Speed, _state.CrossTrackError);
 
         if (switchChanged)
         {
@@ -482,6 +493,8 @@ public class AutoSteerService : IAutoSteerService
         _state.HydLiftState = hydLiftState;
     }
 
+    public void SetSectionBits(ulong sectionBits) => _state.SectionStates = sectionBits;
+
     /// <summary>
     /// Set the current track for guidance.
     /// Called by MainViewModel when active track changes.
@@ -538,36 +551,48 @@ public class AutoSteerService : IAutoSteerService
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void ProcessGpsBuffer(byte[] buffer, int length)
+        => ProcessGpsDatagram(buffer.AsSpan(0, length), AgOpenWeb.Models.GPS.GpsSource.ModulePort);
+
+    /// <inheritdoc />
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public void ProcessGpsDatagram(ReadOnlySpan<byte> datagram, AgOpenWeb.Models.GPS.GpsSource source)
     {
         if (!_isEnabled) return;
 
-        // PERF-05 #7 (autosteer-RX). Cycle = one GPS buffer parsed.
+        // PERF-05 #7 (autosteer-RX). Cycle = one GPS datagram parsed.
         // Marker .perf_autosteer shared with TX. Emits [AutoSteerRx-PERF].
         bool perf = AgOpenWeb.Models.Diagnostics.DiagFlags.PerfAutoSteer;
         long perfT0 = perf ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long perfA0 = perf ? GC.GetAllocatedBytesForCurrentThread() : 0;
         try
         {
-            // Parse directly into VehicleState (zero-copy). ParseIntoState marks
-            // its own parse-timing fields; no BeginNewCycle here because the
-            // cycle owns timing now.
-            ReadOnlySpan<byte> data = buffer.AsSpan(0, length);
-            bool parsed = NmeaParserServiceFast.ParseIntoState(data, ref _state, _configStore);
-            GpsSentences.Record(data, parsed);
-            if (!parsed)
+            lock (_gpsIngestLock)
             {
-                _parseFailures++;
-                return;
+                LastGpsSource = source;
+                // Each whole line parses directly into VehicleState (zero-copy: the line is a
+                // span into the receive buffer unless the splitter had to join it). The parser
+                // marks its own parse-timing fields; no BeginNewCycle here because the cycle
+                // owns timing now.
+                foreach (var line in GpsLines.Lines(datagram, source))
+                {
+                    bool parsed = NmeaParserServiceFast.TryParseIntoState(line, ref _state, _configStore, GpsEpochs, out var result);
+                    GpsSentences.Record(line, result);
+                    if (!parsed)
+                    {
+                        if (result != AgOpenWeb.Models.GPS.NmeaParseResult.EpochMember) _parseFailures++;
+                        continue;
+                    }
+
+                    // Real GPS fix parsed from inbound NMEA — mark the live-GPS gate so the
+                    // internal simulator stays mutually exclusive with a live source. The
+                    // sim feeds via GpsService.UpdateGpsData and never reaches this path.
+                    _gpsService.MarkRealGpsParsed();
+
+                    // Publish the parsed fix to GpsService. This is the sole event the
+                    // cycle worker listens to; everything else runs there.
+                    PublishGpsData();
+                }
             }
-
-            // Real GPS fix parsed from inbound NMEA — mark the live-GPS gate so the
-            // internal simulator stays mutually exclusive with a live source. The
-            // sim feeds via GpsService.UpdateGpsData and never reaches this path.
-            _gpsService.MarkRealGpsParsed();
-
-            // Publish the parsed fix to GpsService. This is the sole event the
-            // cycle worker listens to; everything else runs there.
-            PublishGpsData();
         }
         finally
         {
@@ -630,6 +655,15 @@ public class AutoSteerService : IAutoSteerService
         NotifyStateUpdated();
 
         _cycleCount++;
+    }
+
+    /// <inheritdoc />
+    public void SendCorrectedPosition(double latitude, double longitude, double headingDegrees)
+    {
+        if (!_isEnabled) return;
+        var pgn = PgnBuilder.BuildCorrectedPositionPgn(latitude, longitude, headingDegrees);
+        _udpService.SendToModules(pgn);
+        _udpService.SendToLoopback(pgn);
     }
 
     /// <summary>

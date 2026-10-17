@@ -707,7 +707,45 @@ public static class WireCodec
                 WriteStr(w, sd.Sentences[i].Text);
                 w.Write((float)sd.Sentences[i].AgeSeconds);
             }
+            // Ingest counters and the source: i32 bad checksum, unknown sentence, lines joined
+            // across datagrams, bytes dropped; str source ("192.168.5.11 · GPS1 :2211").
+            w.Write((int)Math.Min(sd.BadChecksum, int.MaxValue));
+            w.Write((int)Math.Min(sd.UnknownSentence, int.MaxValue));
+            w.Write((int)Math.Min(sd.JoinedLines, int.MaxValue));
+            w.Write((int)Math.Min(sd.DroppedBytes, int.MaxValue));
+            WriteStr(w, sd.Source);
+            // Epochs closed by the next epoch's start with a learned member missing.
+            w.Write((int)Math.Min(sd.IncompleteEpochs, int.MaxValue));
         }
+        // GPS data lost (append-only): the host's debounced flag, so client and host agree.
+        w.Write((byte)(s.GpsLost ? 1 : 0));
+        // ISOBUS task controller (append-only, #312): [u8 present] then u8 section control,
+        // u8 sections, u8 clients, u32 reported low, u32 reported high.
+        var iso = s.Isobus;
+        w.Write((byte)(iso != null ? 1 : 0));
+        if (iso != null)
+        {
+            w.Write((byte)(iso.SectionControl ? 1 : 0));
+            w.Write((byte)Math.Clamp(iso.Sections, 0, 255));
+            w.Write((byte)Math.Clamp(iso.Clients, 0, 255));
+            w.Write((uint)(iso.Reported & 0xFFFFFFFF));
+            w.Write((uint)(iso.Reported >> 32));
+        }
+        // Field data card (append-only, #321): [u8 present] then f64 boundary area,
+        // actual area, trip area (m²), trip distance (m).
+        var fd = s.FieldData;
+        w.Write((byte)(fd != null ? 1 : 0));
+        if (fd != null)
+        {
+            w.Write(fd.BoundaryAreaSqM);
+            w.Write(fd.ActualAreaSqM);
+            w.Write(fd.TripAreaSqM);
+            w.Write(fd.TripDistanceM);
+        }
+        // Network IO: PGN 100 sent (append-only, #337).
+        w.Write((byte)(s.SendCorrectedPosition ? 1 : 0));
+        // Network IO: the subnet the scan came from (append-only, #334).
+        WriteStr(w, s.ScanReplySubnet);
         return ms.ToArray();
     }
 
@@ -791,6 +829,11 @@ public static class WireCodec
         w.Write(reset);              // u8 (0/1)
         return ms.ToArray();
     }
+
+    /// <summary>No coverage grid any more (field closed): a reset init with an empty grid.
+    /// The client drops its raster and perimeter (transport.js / app.js onCoverageInit).</summary>
+    public static byte[] EncodeCoverageClear() =>
+        EncodeCoverageInit(new CoverageInitDto(0, 0, 0, 0, 0), reset: true);
 
     public static byte[] EncodeCoverageCells(CoverageCellsDto c)
     {

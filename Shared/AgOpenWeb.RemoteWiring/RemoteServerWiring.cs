@@ -51,7 +51,7 @@ public static partial class RemoteServerWiring
                             var num = System.Globalization.NumberStyles.Float;
                             // Starting a line or path turns contour off first, like AgOpenGPS's
                             // track / AB+ / draw / record / path Go buttons (#110).
-                            if (vm.IsContourModeOn && cmd is "track.activate" or "track.aPlus" or "track.drawStraight"
+                            if (vm.IsContourModeOn && cmd is "track.activate" or "track.aPlus" or "track.latLonHeading" or "track.latLonAB" or "track.drawStraight"
                                     or "track.drawCurve" or "track.recordCurve" or "track.driveAB" or "recpath.play")
                                 vm.ToggleContourModeCommand?.Execute(null);
 
@@ -86,6 +86,13 @@ public static partial class RemoteServerWiring
                                 case "section.toggleZone": // Tier-2 (gated); arg = zone 1..8 (#111)
                                     if (int.TryParse(arg, System.Globalization.NumberStyles.Integer, inv, out var zi))
                                         vm.ToggleZone(zi);
+                                    return;
+                                case "fielddata.resetTrip": // Tier-1; the card's trip Reset (#321)
+                                    vm.ResetTrip();
+                                    return;
+                                case "isobus.sectionControl": // Tier-2 (gated); toggle the implement's section control (#312)
+                                    services.GetRequiredService<AgOpenWeb.Services.Interfaces.IIsobusTaskControllerService>()
+                                        .ToggleSectionControl();
                                     return;
                                 case "section.toggle": // Tier-2 (gated); cycle one section
                                     if (int.TryParse(arg, System.Globalization.NumberStyles.Integer, inv, out var si)
@@ -183,6 +190,23 @@ public static partial class RemoteServerWiring
                                     var ri = arg.IndexOf(',');
                                     if (ri > 0 && int.TryParse(arg[..ri], out var rti))
                                         vm.RenameTrackAt(rti, arg[(ri + 1)..]);
+                                    return;
+                                }
+                                case "track.aPlus": // Quick AB. arg = heading in degrees, or empty for
+                                    // the vehicle's heading (#335). Ungated, like the other creators.
+                                    vm.CreateAPlusLine(double.TryParse(arg, num, inv, out var apd) ? apd : null);
+                                    return;
+                                case "track.latLonHeading": // Quick AB. arg = "lat,lon,heading" (#335)
+                                case "track.latLonAB":      // Quick AB. arg = "latA,lonA,latB,lonB" (#335)
+                                {
+                                    var llParts = arg.Split(',');
+                                    var ll = new double[llParts.Length];
+                                    for (int i = 0; i < llParts.Length; i++)
+                                        if (!double.TryParse(llParts[i], num, inv, out ll[i])) return;
+                                    if (cmd == "track.latLonHeading" && ll.Length == 3)
+                                        vm.CreateLatLonHeadingLine(ll[0], ll[1], ll[2]);
+                                    else if (cmd == "track.latLonAB" && ll.Length == 4)
+                                        vm.CreateLatLonABLine(ll[0], ll[1], ll[2], ll[3]);
                                     return;
                                 }
                                 case "track.select": // Tracks manager / Field Builder — tap a row:
@@ -607,6 +631,7 @@ public static partial class RemoteServerWiring
                                 "track.shrinkA" => vm.ShrinkTrackACommand,
                                 "track.shrinkB" => vm.ShrinkTrackBCommand,
                                 "track.cycle" => vm.CycleABLinesCommand,
+                                "track.cycleBack" => vm.CycleABLinesBackCommand,
                                 "track.smooth" => vm.SmoothABLineCommand,
                                 "track.deleteContours" => vm.DeleteContoursCommand,
                                 "track.autoTrack" => vm.ToggleAutoTrackCommand,
@@ -620,7 +645,6 @@ public static partial class RemoteServerWiring
                                 "track.drawFinish" => vm.FinishDrawCurveCommand,
                                 "track.drawUndo" => vm.UndoLastDrawnPointCommand,
                                 "track.drawCancel" => vm.CancelABCreationCommand,
-                                "track.aPlus" => vm.StartAPlusLineCommand,
                                 "track.boundaryCurve" => vm.CreateCurveFromBoundaryCommand,
                                 "track.allEdges" => vm.CreateTracksFromAllEdgesCommand,
 
@@ -673,6 +697,7 @@ public static partial class RemoteServerWiring
                     // fresh control authority (Phase 2 safety gate).
                     server.IsRestrictedCommand = id =>
                         id.StartsWith("section.") || id.StartsWith("autosteer.")
+                        || id.StartsWith("isobus.") // switches the implement's section control
                         || id.StartsWith("youturn.") || id.StartsWith("contour.")
                         || (id.StartsWith("track.") && !UngatedTrackIds.Contains(id)) // see below
                         || (id.StartsWith("headland.") && !UngatedHeadlandIds.Contains(id))
@@ -835,20 +860,43 @@ public static partial class RemoteServerWiring
                     var headingFusion = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IGpsHeadingFusionService>();
                     server.HeadingChartProvider = () => (headingFusion.GpsHeadingDeg, headingFusion.ImuCorrectedDeg);
 
+                    // Field data card (#321): boundary area, actual area and the trip counters.
+                    var fieldDataCoverage = services.GetRequiredService<AgOpenWeb.Services.Interfaces.ICoverageMapService>();
+                    server.FieldDataProvider = () => vm.IsFieldOpen
+                        ? new AgOpenWeb.RemoteServer.FieldDataDto(vm.FieldBoundaryAreaSqM,
+                            fieldDataCoverage.ActualAreaCovered, fieldDataCoverage.TotalWorkedAreaUser, vm.TripDistanceMeters)
+                        : null;
+
+                    // ISOBUS task controller (#312): its heartbeat for the status frame.
+                    var isobusSvc = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IIsobusTaskControllerService>();
+                    server.IsobusProvider = () =>
+                    {
+                        var st = isobusSvc.Status;
+                        return st.IsAlive
+                            ? new AgOpenWeb.RemoteServer.IsobusDto(st.SectionControlEnabled, st.SectionCount, st.ClientCount, st.ReportedSections)
+                            : null;
+                    };
+
                     // GPS source (#157): the incoming sentence for the GPS detail card, and
                     // "Dual GPS on but no dual heading" while real GPS is live ($PANDA with
                     // Dual on: the heading stage falls back to the single-antenna heading).
                     var gpsSvc = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IGpsService>();
+                    var steerForLabel = services.GetRequiredService<AgOpenWeb.Services.Interfaces.IAutoSteerService>();
                     server.GpsSourceProvider = () =>
                     {
                         var sentence = gpsSvc.CurrentData?.SentenceType switch
                         {
                             AgOpenWeb.Models.GpsSentenceType.Panda => "PANDA",
                             AgOpenWeb.Models.GpsSentenceType.Paogi => "PAOGI",
+                            AgOpenWeb.Models.GpsSentenceType.Ksxt => "KSXT",
+                            // The family as the receiver prints it ("GGA+VTG+HPR"), once learned.
+                            AgOpenWeb.Models.GpsSentenceType.NmeaEpoch =>
+                                steerForLabel.GpsEpochs.IsLearned ? steerForLabel.GpsEpochs.FamilyText : "GGA…",
+                            AgOpenWeb.Models.GpsSentenceType.Inspvax => "INSPVAX",
                             AgOpenWeb.Models.GpsSentenceType.Simulator => "SIM",
                             _ => "",
                         };
-                        return (sentence, headingFusion.IsDualHeadingMissing && gpsSvc.IsGpsLive);
+                        return (sentence, headingFusion.IsDualHeadingWarning && gpsSvc.IsGpsLive);
                     };
 
                     // System Data card (Network IO → GPS): like AgIO's and AgOpenGPS's
@@ -863,6 +911,17 @@ public static partial class RemoteServerWiring
                         var sentences = new System.Collections.Generic.List<AgOpenWeb.RemoteServer.GpsSentenceDto>(raw.Sentences.Count);
                         foreach (var s in raw.Sentences)
                             sentences.Add(new AgOpenWeb.RemoteServer.GpsSentenceDto(s.Type, s.Text, s.AgeSeconds));
+                        // Where the sentences come in: the sender's address and the port
+                        // (the module port, or Ace's GPS1 / GPS2 ports a bridge may use).
+                        var gpsAddress = services.GetRequiredService<IUdpCommunicationService>()
+                            .GetModuleIpAddress(AgOpenWeb.Services.Interfaces.ModuleType.GPS) ?? "";
+                        var port = steerSvc.LastGpsSource switch
+                        {
+                            AgOpenWeb.Models.GPS.GpsSource.Gps1 => "GPS1 :2211",
+                            AgOpenWeb.Models.GPS.GpsSource.Gps2 => "GPS2 :2222",
+                            _ => ":9999",
+                        };
+                        var source = gpsAddress.Length > 0 ? gpsAddress + " · " + port : "";
                         return new AgOpenWeb.RemoteServer.SystemDataDto(
                             d.ImuPitch, d.ImuYawRate,
                             d.ImuValid ? d.ImuHeading : double.NaN,
@@ -871,7 +930,10 @@ public static partial class RemoteServerWiring
                             d.HasDualHeading && d.SentenceType != AgOpenWeb.Models.GpsSentenceType.Simulator
                                 ? d.CurrentPosition.Heading : double.NaN,
                             headingFusion.GpsHeadingDeg,
-                            raw.RateHz, raw.Missed, raw.Rejected, sentences);
+                            raw.RateHz, raw.Missed, raw.Rejected, sentences,
+                            raw.BadChecksum, raw.UnknownSentence,
+                            steerSvc.GpsLines.JoinedLines, steerSvc.GpsLines.DroppedBytes, source,
+                            steerSvc.GpsEpochs.IncompleteEpochs);
                     };
 
                     server.HeadlandSegsProvider = () =>

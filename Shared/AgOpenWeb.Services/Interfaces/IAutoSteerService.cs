@@ -30,6 +30,17 @@ public interface IAutoSteerService
     /// System Data card.</summary>
     AgOpenWeb.Services.Gps.GpsSentenceMonitor GpsSentences { get; }
 
+    /// <summary>The line splitter in front of the parser: how many lines a bridge cut
+    /// across datagrams, and bytes that belonged to no line (System Data card).</summary>
+    AgOpenWeb.Services.Gps.NmeaLineSplitter GpsLines { get; }
+
+    /// <summary>The port the last GPS datagram came in on (Network IO names it).</summary>
+    AgOpenWeb.Models.GPS.GpsSource LastGpsSource { get; }
+
+    /// <summary>The epoch assembler for receivers that spread a fix over standard sentences
+    /// (GGA/GNS + VTG + HPR/HDT/THS): the learned family and the incomplete-epoch count.</summary>
+    AgOpenWeb.Services.Gps.NmeaEpochAssembler GpsEpochs { get; }
+
     /// <summary>
     /// Event fired when the control cycle completes (for UI updates).
     /// Note: UI should not rely on this for control - it's purely observational.
@@ -78,12 +89,25 @@ public interface IAutoSteerService
     void ProcessGpsBuffer(byte[] buffer, int length);
 
     /// <summary>
+    /// As <see cref="ProcessGpsBuffer"/>, for a datagram from any GPS port: every whole line
+    /// in it goes through the parser (one line per datagram is the normal case and stays
+    /// zero-copy; a bridge that batches or cuts lines is handled by the splitter).
+    /// </summary>
+    void ProcessGpsDatagram(ReadOnlySpan<byte> datagram, AgOpenWeb.Models.GPS.GpsSource source);
+
+    /// <summary>
     /// Process simulated position data (bypass NMEA parsing).
     /// Used by simulator which already has parsed GPS data.
     /// </summary>
     void ProcessSimulatedPosition(double latitude, double longitude, double altitude,
         double headingDegrees, double speedMps, int fixQuality, int satellites, double hdop,
         double easting, double northing);
+
+    /// <summary>
+    /// Send PGN 100 (corrected position) to the module subnet and to AgIO's loopback
+    /// port, once per fix, as AgOpenGPS does. Seed monitors and rate controllers use it.
+    /// </summary>
+    void SendCorrectedPosition(double latitude, double longitude, double headingDegrees);
 
     /// <summary>
     /// Update guidance results from external calculation (e.g. ViewModel guidance).
@@ -181,6 +205,13 @@ public interface IAutoSteerService
     /// Called by ViewModel after section control updates.
     /// </summary>
     void SetMachineState(ulong sectionBits, bool isInUTurn, byte hydLiftState = 0);
+
+    /// <summary>
+    /// Update only the section bits carried by PGN 254, 239 and 229. Called by the
+    /// host control loop on every tick, right after section control ran, so a section
+    /// edge decided between two GPS fixes goes out with that tick's PGNs (#311).
+    /// </summary>
+    void SetSectionBits(ulong sectionBits);
 
     // ═══════════════════════════════════════════════════════════════════════
     // Module Feedback (PGN 253, 250)

@@ -71,7 +71,7 @@ public class GuidancePipelineIntegrationTests
 
             var output = _guidance.CalculateGuidance(input);
             state = output.State;
-            _sim.Tick(output.SteerAngle);
+            _sim.Tick(output.SteerAngle, GpsSimulationService.StepSeconds); // one whole step
             lastXte = Math.Abs(output.CrossTrackError);
         }
 
@@ -115,7 +115,7 @@ public class GuidancePipelineIntegrationTests
 
             var output = _guidance.CalculateGuidance(input);
             state = output.State;
-            _sim.Tick(output.SteerAngle);
+            _sim.Tick(output.SteerAngle, GpsSimulationService.StepSeconds); // one whole step
             lastXte = Math.Abs(output.CrossTrackError);
         }
 
@@ -165,7 +165,7 @@ public class GuidancePipelineIntegrationTests
 
             var output = _guidance.CalculateGuidance(input);
             state = output.State;
-            _sim.Tick(output.SteerAngle);
+            _sim.Tick(output.SteerAngle, GpsSimulationService.StepSeconds); // one whole step
             if (Math.Abs(output.CrossTrackError) < 2.0) onTrackCount++;
         }
 
@@ -261,7 +261,7 @@ public class GuidancePipelineIntegrationTests
     public void NmeaPipeline_RealSentence_ProducesValidPosition()
     {
         var gpsService = new GpsService();
-        var parser = new NmeaParserServiceFast(gpsService);
+        var parser = new NmeaParserServiceFast(gpsService, new ConfigurationStore());
         GpsData? received = null;
         gpsService.GpsDataUpdated += (s, d) => received = d;
 
@@ -278,7 +278,7 @@ public class GuidancePipelineIntegrationTests
     public void NmeaPipeline_MultipleUpdates_TracksPosition()
     {
         var gpsService = new GpsService();
-        var parser = new NmeaParserServiceFast(gpsService);
+        var parser = new NmeaParserServiceFast(gpsService, new ConfigurationStore());
         var lats = new List<double>();
         gpsService.GpsDataUpdated += (s, d) => { if (d.IsValid) lats.Add(d.CurrentPosition.Latitude); };
 

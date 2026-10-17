@@ -55,9 +55,18 @@ public partial class MainViewModel
         // For values not yet on State.Vehicle (RollDegrees), cache here.
         _latestRollDegrees = result.RollDegrees;
 
+        // Field data card: trip distance (#321).
+        if (result.GpsValid) AccumulateTripDistance(result.Easting, result.Northing);
+
         // Sole writer to State.Vehicle — Phase B completion. Was previously
         // also written from MainViewModel.HandleGpsUiUpdates on the
         // _gpsService.GpsDataUpdated callback path (Rule 2 violation).
+        // $KSXT carries neither HDOP nor the correction age (its age slot is reserved), and
+        // neither does #INSPVAXA, so those read "—" rather than a reassuring 0.0. The
+        // pipeline's own fix validator saw the raw zeros, which pass; the receiver's RTK
+        // timeout is the only stale-corrections guard on those sentences.
+        bool reportsHdopAndAge = result.SentenceType
+            is not (AgOpenWeb.Models.GpsSentenceType.Ksxt or AgOpenWeb.Models.GpsSentenceType.Inspvax);
         State.Vehicle.UpdateFromGps(
             new AgOpenWeb.Models.Position
             {
@@ -71,8 +80,9 @@ public partial class MainViewModel
             },
             result.FixQuality,
             result.SatelliteCount,
-            result.Hdop,
-            result.DifferentialAge);
+            reportsHdopAndAge ? result.Hdop : double.NaN,
+            reportsHdopAndAge ? result.DifferentialAge : double.NaN);
+        State.Vehicle.Roll = result.RollDegrees; // the web UI's roll readout and roll-zero read this
 
         // Tool position — set ToolEasting LAST to trigger map update
         ToolNorthing = result.ToolNorthing;
@@ -128,6 +138,7 @@ public partial class MainViewModel
             // only on turn start/end) — see TMP-001 resolution.
             sy.TurnPath = yt.TurnPath is List<AgOpenWeb.Models.Base.Vec3> tp ? tp : yt.TurnPath?.ToList();
             sy.PathIndex = yt.PathIndex;
+            sy.ArcStart = yt.ArcStart;
             sy.IsTurnLeft = yt.IsTurnLeft;
             sy.LastTurnWasLeft = yt.LastTurnWasLeft;
             sy.DistanceToHeadland = yt.DistanceToHeadland;

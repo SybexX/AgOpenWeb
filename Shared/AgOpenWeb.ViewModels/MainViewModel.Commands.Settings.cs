@@ -211,7 +211,7 @@ public partial class MainViewModel
                 catch { /* screenshot is optional */ }
 
                 var zipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, _configStore, screenshotPng: screenshot,
+                    _settingsService, AgOpenWeb.Models.State.RuntimeStateCapture.From(_appState), _configStore, screenshotPng: screenshot,
                     activeJobTaskName: SaveCoverageForDump(),
                     ntripRtcmReport: NtripRtcmReport());
                 StatusMessage = $"Debug dump saved: {zipPath}";
@@ -244,7 +244,7 @@ public partial class MainViewModel
             try
             {
                 _bugReportTempZipPath = Services.DebugDumpService.CreateDump(
-                    _settingsService, _appState, _configStore, screenshotPng: _bugReportScreenshot,
+                    _settingsService, AgOpenWeb.Models.State.RuntimeStateCapture.From(_appState), _configStore, screenshotPng: _bugReportScreenshot,
                     activeJobTaskName: SaveCoverageForDump(),
                     ntripRtcmReport: NtripRtcmReport());
             }
@@ -349,7 +349,7 @@ public partial class MainViewModel
                     // everything in one shot now.
                     zipPath = Services.DebugDumpService.CreateDump(
                         _settingsService,
-                        _appState,
+                        AgOpenWeb.Models.State.RuntimeStateCapture.From(_appState),
                         _configStore,
                         additionalNotes: notes,
                         screenshotPng: _bugReportScreenshot,
@@ -652,7 +652,7 @@ public partial class MainViewModel
         var global = new SettingsGroupItem("Global");
         global.Items.Add(new SettingsValueItem("Active Profile", store.ActiveVehicleProfileName));
         global.Items.Add(new SettingsValueItem("Is Metric", store.IsMetric.ToString()));
-        global.Items.Add(new SettingsValueItem("Num Sections", store.NumSections.ToString()));
+        global.Items.Add(new SettingsValueItem("Num Sections", store.NumSections.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         global.Items.Add(new SettingsValueItem("Actual Tool Width",
             store.IsMetric ? $"{store.ActualToolWidth:F2} m"
                            : $"{AgOpenWeb.Models.Base.UnitConversion.MetersToFeet(store.ActualToolWidth):F2} ft"));

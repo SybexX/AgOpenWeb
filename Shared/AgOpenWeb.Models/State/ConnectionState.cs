@@ -60,6 +60,16 @@ public class ConnectionState : ObservableObject
         set => SetProperty(ref _isGpsConnected, value);
     }
 
+    /// <summary>No position sentences for a couple of seconds (module or simulator):
+    /// autosteer and the sections have been switched off, and the client shows the
+    /// warning until data flows again.</summary>
+    private bool _isGpsLost;
+    public bool IsGpsLost
+    {
+        get => _isGpsLost;
+        set => SetProperty(ref _isGpsLost, value);
+    }
+
     private bool _isGpsDataOk;
     public bool IsGpsDataOk
     {
@@ -212,6 +222,15 @@ public class ConnectionState : ObservableObject
     {
         get => _moduleSubnet;
         set => SetProperty(ref _moduleSubnet, value);
+    }
+
+    // Bytes 9–11 of the last scan reply: the subnet the scan came from (AgOpenGPS
+    // firmware), offered as the subnet to move the modules to (#334).
+    private string? _scanReplySubnet;
+    public string? ScanReplySubnet
+    {
+        get => _scanReplySubnet;
+        set => SetProperty(ref _scanReplySubnet, value);
     }
 
     // Overall status

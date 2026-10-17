@@ -19,7 +19,6 @@ public class SectionControlServiceTests
 {
     private ICoverageMapService _coverageMap = null!;
     private IToolPositionService _toolPosition = null!;
-    private ApplicationState _appState = null!;
     private SectionControlService _service = null!;
 
     [SetUp]
@@ -38,9 +37,8 @@ public class SectionControlServiceTests
 
         _coverageMap = Substitute.For<ICoverageMapService>();
         _toolPosition = Substitute.For<IToolPositionService>();
-        _appState = new ApplicationState();
 
-        _service = new SectionControlService(_toolPosition, _coverageMap, _appState, ConfigurationStore.Instance);
+        _service = new SectionControlService(_toolPosition, _coverageMap, ConfigurationStore.Instance);
     }
 
     #region Slow Speed
@@ -80,7 +78,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         _service.SetAllAuto();
         _service.MasterState = SectionMasterState.Auto;
@@ -115,7 +113,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
     }
 
     [Test]
@@ -182,7 +180,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         ConfigurationStore.Instance.Tool.LookAheadOnSetting = 0.2;  // 200 ms wait
 
@@ -215,7 +213,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         ConfigurationStore.Instance.Tool.LookAheadOnSetting = 0.2;
 
@@ -251,7 +249,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         ConfigurationStore.Instance.Tool.MinCoverage = 70; // ON=0.70, OFF=0.99
         _service.SetAllAuto();
@@ -337,7 +335,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         // Use non-zero LookAheadOff so a single tick of shouldBeOff doesn't
         // accumulate enough phase ticks to actually flip IsOn — that's the
@@ -440,7 +438,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         ConfigurationStore.Instance.Tool.LookAheadOnSetting = 0;
         ConfigurationStore.Instance.Tool.LookAheadOffSetting = 0;
@@ -474,7 +472,7 @@ public class SectionControlServiceTests
         outerPoly.Points.Add(new BoundaryPoint(200, 200, 0));
         outerPoly.Points.Add(new BoundaryPoint(0, 200, 0));
         outerPoly.UpdateBounds();
-        _appState.Field.CurrentBoundary = new Boundary { OuterBoundary = outerPoly };
+        _service.SetFieldContext(new AgOpenWeb.Models.Sections.SectionFieldContext(new Boundary { OuterBoundary = outerPoly }, null, true, false));
 
         ConfigurationStore.Instance.Tool.LookAheadOnSetting = 0.5;  // 500 ms
         ConfigurationStore.Instance.Tool.LookAheadOffSetting = 0.4; // 400 ms
@@ -613,6 +611,53 @@ public class SectionControlServiceTests
     public void GetSectionBits_AllOff_ReturnsZero()
     {
         Assert.That(_service.GetSectionBits(), Is.EqualTo(0));
+    }
+
+    // #317: only the configured sections reach the wire. SetUp configures 3.
+    [Test]
+    public void SetAllSectionsOn_SetsOnlyTheConfiguredSectionBits()
+    {
+        _service.SetAllSections(SectionButtonState.On);
+
+        Assert.That(_service.GetSectionBits(), Is.EqualTo(0b111));
+        Assert.That(_service.GetSectionBits64(), Is.EqualTo(0b111UL));
+        Assert.That(_service.SectionStates[3].IsOn, Is.False, "section 4 isn't configured");
+        Assert.That(_service.SectionStates[3].ButtonState, Is.EqualTo(SectionButtonState.On),
+            "every button takes the state, as in AgOpenGPS");
+    }
+
+    [Test]
+    public void SetAllSectionsOn_MoreThan16Sections_BitsStopAtTheSectionCount()
+    {
+        ConfigurationStore.Instance.NumSections = 20;
+
+        _service.SetAllSections(SectionButtonState.On);
+
+        Assert.That(_service.GetSectionBits(), Is.EqualTo(0xFFFF));
+        Assert.That(_service.GetSectionBits64(), Is.EqualTo((1UL << 20) - 1));
+    }
+
+    [Test]
+    public void SectionCountReduced_SectionsBeyondItGoOff()
+    {
+        ConfigurationStore.Instance.NumSections = 8;
+        _service.SetAllSections(SectionButtonState.On);
+        Assume.That(_service.GetSectionBits(), Is.EqualTo(0xFF));
+
+        ConfigurationStore.Instance.NumSections = 2;
+
+        Assert.That(_service.GetSectionBits(), Is.EqualTo(0b11));
+        Assert.That(_service.SectionStates[5].IsOn, Is.False);
+        Assert.That(_service.SectionStates[5].IsMappingOn, Is.False);
+    }
+
+    [Test]
+    public void SetSectionStateOn_BeyondTheSectionCount_DoesNotSwitchItOn()
+    {
+        _service.SetSectionState(5, SectionButtonState.On);
+
+        Assert.That(_service.SectionStates[5].IsOn, Is.False);
+        Assert.That(_service.GetSectionBits64(), Is.Zero);
     }
 
     #endregion

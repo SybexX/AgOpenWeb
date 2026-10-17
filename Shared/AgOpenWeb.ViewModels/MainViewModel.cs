@@ -514,6 +514,18 @@ public partial class MainViewModel : ObservableObject
                 OnPropertyChanged(nameof(CurrentFieldName));
                 OnPropertyChanged(nameof(CurrentFieldAndJobLabel));
             }
+            else if (e.PropertyName == nameof(State.Field.LocalPlane))
+            {
+                // The cycle converts against the committed plane and runs the origin guard on
+                // it; every writer (field open, the cycle's own commits above, field close)
+                // lands here, so this is the one push.
+                _gpsPipelineService.SetLocalPlane(State.Field.LocalPlane);
+            }
+            else if (e.PropertyName is nameof(State.Field.CurrentBoundary) or nameof(State.Field.HeadlandLine)
+                     or nameof(State.Field.ActiveField))
+            {
+                SyncFieldContextToSectionControl();
+            }
         };
 
         // Wire YouTurn state -> IsUTurnDistanceVisible computed property
@@ -582,6 +594,9 @@ public partial class MainViewModel : ObservableObject
         // non-false, e.g. IsAutoTrackEnabled=true, and a few are restored above) — the
         // setters only push on change, so the projector would otherwise read stale zeros.
         State.FieldTools.IsHeadlandOn = _isHeadlandOn;
+        _gpsPipelineService.SetHeadlandOn(_isHeadlandOn);
+        _gpsPipelineService.SetSimulatorEnabled(_isSimulatorEnabled);
+        SyncFieldContextToSectionControl();
         State.FieldTools.IsAutoTrackEnabled = ConfigStore.Display.AutoTrack; // persisted
         State.FieldTools.UTurnSkipRows = _uTurnSkipRows;
         State.FieldTools.IsUTurnSkipRowsEnabled = _isUTurnSkipRowsEnabled;
@@ -616,7 +631,8 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// Host control loop tick handler (#313). Runs at 100 Hz on the loop's
     /// own thread. Reads the latest GPS-anchored pose from the estimator,
-    /// updates tool position + section state machine, then sends PGN 254 +
+    /// updates tool position + section state machine, hands the section bits
+    /// to the sender, then sends PGN 254 +
     /// PGN 239 so the firmware autosteer task — which also runs at 100 Hz
     /// — sees fresh data every cycle.
     /// </summary>
@@ -639,6 +655,10 @@ public partial class MainViewModel : ObservableObject
                 p.Heading,
                 p.SpeedMps);
         }
+        // Hand this tick's section bits to the sender (#311). The GPS cycle writes them
+        // too, but only once per fix; an edge decided here, or a section button tapped
+        // between fixes, must not wait for the next one.
+        _autoSteerService.SetSectionBits(_sectionControlService.GetSectionBits64());
         _autoSteerService.SendPgnsForControlTick();
     }
 
@@ -981,12 +1001,15 @@ public partial class MainViewModel : ObservableObject
                 // The subnet is only known after a scan reply.
                 State.Connections.GpsIpAddress = _udpService.GetModuleIpAddress(ModuleType.GPS);
                 State.Connections.ModuleSubnet = _udpService.GetModuleSubnet();
+                State.Connections.ScanReplySubnet = _udpService.GetScanReplySubnet();
 
                 // Legacy property updates (for existing bindings - will be removed in Phase 5)
                 IsAutoSteerDataOk = steerOk;
                 IsMachineDataOk = machineOk;
                 IsImuDataOk = imuOk;
                 IsGpsDataOk = gpsOk;
+
+                UpdateGpsLost(gpsOk, Clock.Current.Now);
 
                 if (!gpsOk)
                 {
@@ -2054,8 +2077,10 @@ public partial class MainViewModel : ObservableObject
         // Clear headland
         LoadHeadlandFromField(null);
 
-        // Clear background
+        // Clear background. The web client draws whatever State.Field.Imagery says, so
+        // null it here or the closed field's picture stays on screen until the next open.
         _mapService.ClearBackground();
+        State.Field.Imagery = null;
 
         // Clear tracks (State.Field.Tracks mirrors SavedTracks via the ctor subscription)
         SavedTracks.Clear();
@@ -2064,6 +2089,12 @@ public partial class MainViewModel : ObservableObject
 
         // Clear U-turn state
         ClearYouTurnState();
+
+        // Clear tram lines and the field's tram systems (saved above). Field open clears them
+        // too, but between close and the next open the map was still drawing the old lines.
+        _tramLineService.Clear();
+        _tramSystemLineRanges.Clear();
+        ConfigStore.Tram.Systems.Clear();
 
         // Clear flags (without saving — IsFieldOpen is already false) so they don't carry
         // over into the next field (#107)
@@ -2388,8 +2419,9 @@ public partial class MainViewModel : ObservableObject
                     // Clear the track and guidance from the map when deactivated
                     _mapService.SetActiveTrack(null);
                     _mapService.SetBaseTrack(null);
-                    State.Guidance.DisplayLine = null; // clear the web magenta offset line too
-                    _lastMirroredDisplayTrack = null;  // re-mirror on the next selection
+                    // The pipeline sync below clears its track, so the next cycle's snapshot
+                    // carries a null DisplayTrack and the mirror clears State.Guidance.DisplayLine
+                    // (the web's magenta offset line) — its cache is left alone so that change is seen.
                     _lastMirroredBaseTrack = null;
                     _mapService.SetGuidancePoints(0, 0, false);
                     _isSelectedTrackOnBoundary = false;
@@ -3665,6 +3697,8 @@ public partial class MainViewModel : ObservableObject
             if (SetProperty(ref _isHeadlandOn, value))
             {
                 State.FieldTools.IsHeadlandOn = value; // mirror for the web-UI projector
+                _gpsPipelineService.SetHeadlandOn(value); // distance HUD + hydraulic lift (#106)
+                SyncFieldContextToSectionControl();        // headland section control (#106)
                 StatusMessage = value ? "Headland ON" : "Headland OFF";
                 _mapService.SetHeadlandVisible(value);
             }
@@ -4031,6 +4065,7 @@ public partial class MainViewModel : ObservableObject
                 // CanExecute when the field is opened or closed.
                 DeleteAppliedAreaCommand?.NotifyCanExecuteChanged();
                 OnPropertyChanged(nameof(IsSectionBarVisible));
+                if (value) RestartTripDistance(); // a field's trip distance starts at its opening (#321)
             }
         }
     }
@@ -4212,6 +4247,7 @@ public partial class MainViewModel : ObservableObject
     public ICommand? StartCurveRecordingCommand { get; private set; }
     public ICommand? FinishCurveRecordingCommand { get; private set; }
     public ICommand? CycleABLinesCommand { get; private set; }
+    public ICommand? CycleABLinesBackCommand { get; private set; }
     public ICommand? SmoothABLineCommand { get; private set; }
     public ICommand? NudgeLeftCommand { get; private set; }
     public ICommand? NudgeRightCommand { get; private set; }
@@ -6108,7 +6144,12 @@ public partial class MainViewModel : ObservableObject
     /// Save tracks to TrackLines.txt in the active field directory.
     /// Uses WinForms-compatible format via TrackFilesService.
     /// </summary>
-    public void SaveTracksToFile()
+    public void SaveTracksToFile() => SaveTracksToFile(refreshNudgeFromGuidance: true);
+
+    /// <param name="refreshNudgeFromGuidance">Recompute the selected track's NudgeDistance from
+    /// the cycle's mirror (pass number + nudge). False when the caller has just set
+    /// NudgeDistance itself and the mirror has not caught up yet (Swap A/B).</param>
+    public void SaveTracksToFile(bool refreshNudgeFromGuidance)
     {
         var activeField = _fieldService.ActiveField;
         if (activeField == null || string.IsNullOrEmpty(activeField.DirectoryPath))
@@ -6120,7 +6161,7 @@ public partial class MainViewModel : ObservableObject
         // saving — but only when State.Guidance is the cycle's mirror FOR this track. Right after
         // selecting a new track (e.g. just created), the mirror still holds the previous track's
         // pass/nudge until the next cycle, and writing it here stamped them onto the new track (#107).
-        if (SelectedTrack != null && ReferenceEquals(State.Guidance.ActiveTrack, SelectedTrack))
+        if (refreshNudgeFromGuidance && SelectedTrack != null && ReferenceEquals(State.Guidance.ActiveTrack, SelectedTrack))
         {
             double widthMinusOverlap = ConfigStore.ActualToolWidth - Tool.Overlap;
             SelectedTrack.NudgeDistance = State.Guidance.HowManyPathsAway * widthMinusOverlap + State.Guidance.NudgeOffset;

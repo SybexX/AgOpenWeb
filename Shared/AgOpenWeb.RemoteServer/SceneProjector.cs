@@ -44,6 +44,10 @@ public sealed class SceneProjector
     // GPS source (#157): the incoming sentence ("PANDA"/"PAOGI"/"SIM", "" before any fix)
     // and whether Dual GPS is on without a dual-antenna heading. Host-supplied.
     public System.Func<(string Sentence, bool DualHeadingMissing)>? GpsSourceProvider { get; set; }
+    // ISOBUS task controller heartbeat (#312). Host-supplied; null while none is heard.
+    public System.Func<IsobusDto?>? IsobusProvider { get; set; }
+    // Field data card (#321). Host-supplied; null with no field open.
+    public System.Func<FieldDataDto?>? FieldDataProvider { get; set; }
     // System Data card (Network IO → GPS): attitude, heading sources, sentence rate and the
     // latest raw sentences. Host-supplied; null before any GPS data.
     public System.Func<SystemDataDto?>? SystemDataProvider { get; set; }
@@ -103,7 +107,7 @@ public sealed class SceneProjector
         var tracks = f.Tracks.ToArray()
             .Where(t => t.IsActive && t.Points.Count >= 2)
             .Select((t, i) => new TrackDto(
-                i.ToString(),
+                i.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 t.Name,
                 (int)t.Type,
                 t.Points.Select(p => new Vec2Dto(p.Easting, p.Northing)).ToList()))
@@ -362,11 +366,13 @@ public sealed class SceneProjector
         var cfg = _config.Connections;
         var sw = _smartWas.GetSnapshot();
         var gpsSource = GpsSourceProvider?.Invoke() ?? ("", false);
+        // With the data lost, the last fix is history: read "No Fix", not a stale "RTK Fixed".
+        bool gpsLost = c.IsGpsLost;
         return new StatusDto(
-            v.FixQuality,
-            v.FixQualityText,
-            v.Age,
-            v.SatelliteCount,
+            gpsLost ? 0 : v.FixQuality,
+            gpsLost ? "No Fix" : v.FixQualityText,
+            gpsLost ? 0 : v.Age,
+            gpsLost ? 0 : v.SatelliteCount,
             _config.IsMetric,
             c.IsGpsDataOk,
             c.IsImuDataOk,
@@ -424,7 +430,12 @@ public sealed class SceneProjector
             gpsSource.Sentence ?? "",
             gpsSource.DualHeadingMissing,
             BuildNtripRtcm(),
-            SystemDataProvider?.Invoke());
+            SystemDataProvider?.Invoke(),
+            _state.Connections.IsGpsLost,
+            IsobusProvider?.Invoke(),
+            FieldDataProvider?.Invoke(),
+            cfg.SendCorrectedPosition,
+            c.ScanReplySubnet ?? "");
     }
 
     // Read live for every status frame, so "seconds since the last one" keeps counting

@@ -59,4 +59,35 @@ public class FlagPersistenceTests
         Assert.That(AgOpenWeb.Services.GeoJson.GeoJsonFieldService.LoadFlags(_dir), Has.Count.EqualTo(1),
             "closing must not overwrite the saved flags with an empty list");
     }
+
+    [Test]
+    public async Task ClosingTheField_ClearsTheBackgroundImage()
+    {
+        var vm = OpenFieldVm();
+        vm.State.Field.Imagery = new AgOpenWeb.Models.State.FieldImagery(
+            System.IO.Path.Combine(_dir, "background.png"), -100, -100, 100, 100);
+
+        await vm.CloseFieldAsync();
+
+        Assert.That(vm.State.Field.Imagery, Is.Null, "the web client keeps drawing the picture while the scene carries it");
+    }
+
+    [Test]
+    public async Task ClosingTheField_ClearsCoverageAndTramLines()
+    {
+        var builder = new MainViewModelBuilder();
+        builder.FieldService.ActiveField.Returns(new Field { Name = "F", DirectoryPath = _dir });
+        var vm = builder.Build();
+        vm.IsFieldOpen = true;
+        var tram = AgOpenWeb.Models.Configuration.ConfigurationStore.Instance.Tram;
+        tram.Systems.Clear();
+        tram.Systems.Add(new AgOpenWeb.Models.Tram.TramSystem { Name = "T" });
+
+        await vm.CloseFieldAsync();
+
+        builder.CoverageMapService.Received().ClearAll();
+        builder.CoverageMapService.Received().ClearFieldBounds();
+        builder.TramLineService.Received().Clear();
+        Assert.That(tram.Systems, Is.Empty, "tram systems are field-scoped; they were saved before the clear");
+    }
 }

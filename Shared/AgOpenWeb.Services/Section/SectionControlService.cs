@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using AgOpenWeb.Models;
 using AgOpenWeb.Models.Base;
 using AgOpenWeb.Models.Configuration;
@@ -38,7 +39,10 @@ public class SectionControlService : ISectionControlService
 {
     private readonly IToolPositionService _toolPositionService;
     private readonly ICoverageMapService _coverageMapService;
-    private readonly ApplicationState _state;
+    // The field facts the 100 Hz control-loop tick reads (boundary, headland line, field
+    // open, headland on). Published whole by the UI thread through SetFieldContext; read
+    // once per helper call, never the UI-bound State.Field mirror.
+    private AgOpenWeb.Models.Sections.SectionFieldContext _field = AgOpenWeb.Models.Sections.SectionFieldContext.None;
     private readonly ConfigurationStore _configStore;
 
     private readonly SectionControlState[] _sectionStates;
@@ -165,12 +169,10 @@ public class SectionControlService : ISectionControlService
     public SectionControlService(
         IToolPositionService toolPositionService,
         ICoverageMapService coverageMapService,
-        ApplicationState state,
         ConfigurationStore configStore)
     {
         _toolPositionService = toolPositionService;
         _coverageMapService = coverageMapService;
-        _state = state;
         _configStore = configStore;
 
         // Initialize section states
@@ -208,6 +210,8 @@ public class SectionControlService : ISectionControlService
     // Written by the GPS pipeline thread, read by the control loop.
     private volatile bool _isReversing;
     public bool IsReversing { get => _isReversing; set => _isReversing = value; }
+
+    public void SetFieldContext(AgOpenWeb.Models.Sections.SectionFieldContext context) => Volatile.Write(ref _field, context);
 
     public void Update(Vec3 toolPosition, double toolHeading, double vehicleHeading, double speed)
     {
@@ -897,7 +901,7 @@ public class SectionControlService : ISectionControlService
     /// </summary>
     private bool IsPointInBoundary(Vec2 point)
     {
-        var boundary = _state.Field.CurrentBoundary;
+        var boundary = Volatile.Read(ref _field).Boundary;
         if (boundary == null || !boundary.IsValid)
             return true; // No boundary = always in
 
@@ -909,7 +913,8 @@ public class SectionControlService : ISectionControlService
     /// </summary>
     private BoundaryResult GetSegmentBoundaryStatus(Vec2 sectionCenter, double heading, double halfWidth)
     {
-        var boundary = _state.Field.CurrentBoundary;
+        var field = Volatile.Read(ref _field);
+        var boundary = field.Boundary;
         if (boundary == null || !boundary.IsValid)
         {
             // No usable boundary. Two cases:
@@ -922,7 +927,7 @@ public class SectionControlService : ISectionControlService
             //    is never intended (AiO firmware enforces the same), so treat
             //    every section as fully outside, which gates Auto off and
             //    forces IsOn=false via the strict isInBoundary check.
-            return _state.Field.HasActiveField
+            return field.HasActiveField
                 ? BoundaryResult.FullyInside
                 : BoundaryResult.FullyOutside;
         }
@@ -936,27 +941,24 @@ public class SectionControlService : ISectionControlService
     private bool IsPointInHeadland(Vec2 point)
     {
         var tool = _configStore.Tool;
+        var field = Volatile.Read(ref _field);
 
         // Check if headland section control is enabled — and the headland itself is on
         // (AgOpenGPS: isHeadlandOn && isSectionControlledByHeadland, #106)
-        if (!tool.IsHeadlandSectionControl || !_state.FieldTools.IsHeadlandOn)
+        if (!tool.IsHeadlandSectionControl || !field.IsHeadlandOn)
             return false; // Headland control disabled
 
-        var headlandLine = _state.Field.HeadlandLine;
+        var headlandLine = field.HeadlandLine;
         if (headlandLine == null || headlandLine.Count < 3)
             return false; // No headland = never in headland
 
-        // Point is in headland if it's inside boundary but outside headland line
-        var boundary = _state.Field.CurrentBoundary;
-        if (boundary == null || !boundary.IsValid)
-            return false;
-
-        bool inBoundary = boundary.IsPointInside(point.Easting, point.Northing);
-        bool insideHeadlandLine = GeometryMath.IsPointInPolygon(headlandLine, point);
-
-        // Headland zone is BETWEEN outer boundary and headland line
-        // If inside boundary but outside headland line = in headland zone
-        return inBoundary && !insideHeadlandLine;
+        // The headland is everything outside the headland line, like AgOpenGPS
+        // (CHead: !IsPointInPolygon(hdLine)). It used to be "inside the boundary but
+        // outside the line", which released the headland gate exactly where the tool
+        // swings past the outer boundary in a U-turn: with "Off outside boundary" off a
+        // section straddling the boundary still counts as in bounds, so the outer
+        // sections painted a half-disc over the boundary at the turn's apex.
+        return !GeometryMath.IsPointInPolygon(headlandLine, point);
     }
 
     public (Vec2 left, Vec2 right) GetSectionWorldPosition(int sectionIndex, Vec3 toolPosition, double toolHeading)
@@ -994,7 +996,8 @@ public class SectionControlService : ISectionControlService
         // service) — otherwise the next Update() tick sees IsOn already false
         // and skips the StopMapping call, leaving coverage painting forever.
         // Auto is left for Update() to determine based on boundaries/coverage.
-        if (state == SectionButtonState.On)
+        // Only a configured section goes on (#317).
+        if (state == SectionButtonState.On && sectionIndex < NumSections)
             _sectionStates[sectionIndex].IsOn = true;
         else if (state == SectionButtonState.Off)
             UpdateSectionOff(sectionIndex);
@@ -1010,6 +1013,7 @@ public class SectionControlService : ISectionControlService
 
     public void SetAllSections(SectionButtonState state)
     {
+        int numSections = NumSections;
         for (int i = 0; i < _sectionStates.Length; i++)
         {
             _sectionStates[i].ButtonState = state;
@@ -1017,7 +1021,9 @@ public class SectionControlService : ISectionControlService
             // Mirror SetSectionState: sync IsOn / IsMappingOn for manual
             // states. Off must route through UpdateSectionOff so coverage
             // mapping is torn down. See SetSectionState for the why.
-            if (state == SectionButtonState.On)
+            // Every button takes the state, as in AgOpenGPS, but only the configured
+            // sections go on: the rest must not reach the module as on bits (#317).
+            if (state == SectionButtonState.On && i < numSections)
                 _sectionStates[i].IsOn = true;
             else if (state == SectionButtonState.Off)
                 UpdateSectionOff(i);
@@ -1087,18 +1093,23 @@ public class SectionControlService : ISectionControlService
             currentPos += sectionWidth;
         }
 
-        // Clear positions for unused sections
+        // Clear positions for unused sections, and switch them off: a section that was
+        // on when the section count was reduced must not stay on in the PGNs (#317).
         for (int i = numSections; i < _sectionStates.Length; i++)
         {
             _sectionStates[i].PositionLeft = 0;
             _sectionStates[i].PositionRight = 0;
+            if (_sectionStates[i].IsOn || _sectionStates[i].IsMappingOn)
+                UpdateSectionOff(i);
         }
     }
 
     public ushort GetSectionBits()
     {
+        // Configured sections only; unused bits stay 0 on the wire, as in AgOpenGPS (#317).
         ushort bits = 0;
-        for (int i = 0; i < 16; i++)
+        int count = Math.Min(16, NumSections);
+        for (int i = 0; i < count; i++)
         {
             if (_sectionStates[i].IsOn)
             {
@@ -1116,7 +1127,7 @@ public class SectionControlService : ISectionControlService
     public ulong GetSectionBits64()
     {
         ulong bits = 0;
-        int count = Math.Min(_sectionStates.Length, ToolConfig.MaxSections);
+        int count = Math.Min(Math.Min(_sectionStates.Length, ToolConfig.MaxSections), NumSections);
         for (int i = 0; i < count; i++)
         {
             if (_sectionStates[i].IsOn)
