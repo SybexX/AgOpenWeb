@@ -1,3 +1,7 @@
+// AgOpenWeb
+// Copyright (C) 2024-2026 AgOpenWeb Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Renderer — consumes plain Scene + Tick objects via the transport interface.
 // It has NO knowledge of SignalR or the wire format (see transport.js); swapping
 // the transport at Phase 2 leaves this file untouched. Canvas2D for now; the
@@ -1843,7 +1847,7 @@ document.getElementById('maptap-cancel').addEventListener('pointerdown', e => { 
 // ---- AB flyout launchers → the three creation/management dialogs ----
 function abFlyoutClose() { bnAb.classList.remove('open'); document.getElementById('bn-abmenu').classList.remove('menuopen'); }
 document.getElementById('bn-tracks').addEventListener('pointerdown', e => { e.stopPropagation(); abFlyoutClose(); openTracksManager(); });
-document.getElementById('bn-quickab').addEventListener('pointerdown', e => { e.stopPropagation(); abFlyoutClose(); qabHeadingReset(); openDialog('dlg-quickab'); });
+document.getElementById('bn-quickab').addEventListener('pointerdown', e => { e.stopPropagation(); abFlyoutClose(); qabHeadingReset(); qabSetSide('right'); openDialog('dlg-quickab'); });
 // A+ heading box (#335): empty each time the dialog opens, the vehicle's heading as its
 // placeholder (refreshed on focus); a typed value goes with track.aPlus.
 const qabHeading = document.getElementById('qab-aplus-heading');
@@ -1857,11 +1861,22 @@ function qabHeadingReset() {
   qabHeading.placeholder = d === null ? '' : d.toFixed(1);
 }
 qabHeading.addEventListener('focus', () => { const d = vehicleHeadingDeg(); if (d !== null) qabHeading.placeholder = d.toFixed(1); });
+// First-pass side for the driven modes (#345): Right each time the dialog opens, like
+// AgOpenGPS; sent just before A+ / Drive AB / Curve so the host moves the line to that side.
+const qabRefSide = document.getElementById('qab-refside');
+let qabSide = 'right';
+function qabSetSide(s) {
+  qabSide = s;
+  for (const b of qabRefSide.children) b.classList.toggle('active', b.dataset.side === s);
+}
+for (const b of qabRefSide.children)
+  b.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); qabSetSide(b.dataset.side); });
 // Quick-AB selector buttons.
 // Quick AB — the single creation hub: GPS-driven, from-boundary, and draw-on-map modes.
 document.getElementById('dlg-quickab').querySelectorAll('[data-qab]').forEach(b => b.addEventListener('pointerdown', e => {
   e.preventDefault(); e.stopPropagation(); closeDialog();
   const m = b.dataset.qab;
+  if (m === 'aPlus' || m === 'driveAB' || m === 'recordCurve') transport.send('track.refSide|' + qabSide);
   if (m === 'aPlus') {
     // A+ builds an AB line from the vehicle's current position + heading. It needs a GPS
     // fix; the host bails silently without one, so give feedback here (StatusMessage isn't
@@ -2175,7 +2190,7 @@ for (const b of document.querySelectorAll('#fb-addtrack .fb-addbtn'))
     showFbTab('tracks');
     if (m === 'ab') startDrawTrack('straight');        // map-tap draw (FB stays open, NO_SCRIM)
     else if (m === 'curve') startDrawTrack('curve');
-    else if (m === 'aplus') transport.send('track.aPlus');
+    else if (m === 'aplus') { transport.send('track.refSide|right'); transport.send('track.aPlus'); }
     else if (m === 'bedge') transport.send('track.createFromBoundary');
     else if (m === 'bcurve') transport.send('track.boundaryCurve');
     else if (m === 'ball') transport.send('track.allEdges');
@@ -3558,11 +3573,24 @@ function renderBugReport() {
   document.getElementById('br-status').textContent = s;
   const m = /(bugreport_[^\/\\]+\.zip)$/.exec(s);
   brFile = m ? m[1] : null;
-  document.getElementById('br-download').style.display = brFile ? '' : 'none';
+  for (const id of ['br-download', 'br-github', 'br-github-hint'])
+    document.getElementById(id).style.display = brFile ? '' : 'none';
 }
 document.getElementById('br-download').addEventListener('pointerdown', e => {
   e.stopPropagation();
   if (brFile) openExternal(location.origin + '/bugreports/' + encodeURIComponent(brFile));
+});
+// GitHub's bug form, prefilled through its field ids (.github/ISSUE_TEMPLATE/bug_report.yml).
+// A URL can't carry the zip, so the user drags in the one Download saved.
+document.getElementById('br-github').addEventListener('pointerdown', e => {
+  e.stopPropagation();
+  const q = new URLSearchParams({ template: 'bug_report.yml' });
+  const title = document.getElementById('br-title').value.trim();
+  const desc = document.getElementById('br-desc').value.trim();
+  if (title) q.set('title', title);
+  if (desc) q.set('description', desc.slice(0, 3000)); // keep the URL within browser limits
+  if (appInfo && appInfo.version) q.set('version', appInfo.version + (appInfo.gitHash ? ' · ' + appInfo.gitHash : ''));
+  openExternal('https://github.com/AgOpenGPS-Official/AgOpenWeb/issues/new?' + q);
 });
 document.getElementById('br-submit').addEventListener('pointerdown', e => {
   e.stopPropagation();
@@ -5957,20 +5985,53 @@ function satZoom() {
   const z = Math.log2(156543.03392 * Math.cos(originLat * Math.PI / 180) * pxPerM);
   return Math.max(2, Math.min(20, Math.round(z)));
 }
-const satTiles = new Map(); // "z/x/y" → { img, skImg }
+// Bing has no tiles past its coverage (rural areas often stop at z19 or below); the host
+// answers 404 for those and the tile is drawn from its nearest ancestor instead. A failed
+// fetch (502, no network) is asked again after SAT_RETRY_MS.
+const SAT_FILL_LEVELS = 6, SAT_RETRY_MS = 15000;
+const satTiles = new Map(); // "z/x/y" → { img, url, skImg, none, retryAt }
+function loadSatTile(t, x, y, z) {
+  const retry = () => { t.retryAt = performance.now() + SAT_RETRY_MS; };
+  t.retryAt = 0;
+  fetch('/sattile/' + tileQuadkey(x, y, z))
+    .then(r => {
+      if (r.status === 404) { t.none = true; return null; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.blob();
+    })
+    .then(b => {
+      if (!b) return;
+      const im = new Image();
+      im.onload = () => { t.img = im; };
+      im.onerror = () => { URL.revokeObjectURL(im.src); retry(); };
+      im.src = t.url = URL.createObjectURL(b);
+    })
+    .catch(retry);
+}
 function getSatTile(x, y, z) {
   const key = z + '/' + x + '/' + y;
   let t = satTiles.get(key);
   if (!t) {
-    t = { img: null, skImg: null };
+    t = { img: null, url: null, skImg: null, none: false, retryAt: 0 };
     satTiles.set(key, t);
-    const im = new Image();
-    im.onload = () => { t.img = im; };
-    im.src = '/sattile/' + tileQuadkey(x, y, z);
-    if (satTiles.size > 500) { const k = satTiles.keys().next().value; const ev = satTiles.get(k); if (ev && ev.skImg) ev.skImg.delete(); satTiles.delete(k); }
+    loadSatTile(t, x, y, z);
+    if (satTiles.size > 500) {
+      const k = satTiles.keys().next().value, ev = satTiles.get(k);
+      if (ev.skImg) ev.skImg.delete();
+      if (ev.url) URL.revokeObjectURL(ev.url);
+      satTiles.delete(k);
+    }
+  } else if (t.retryAt && performance.now() >= t.retryAt) loadSatTile(t, x, y, z);
+  if (t.img && !t.skImg) {
+    t.skImg = CK.MakeImageFromCanvasImageSource(t.img);
+    URL.revokeObjectURL(t.url); t.url = null; t.img = null;
   }
-  if (t.img && !t.skImg) t.skImg = CK.MakeImageFromCanvasImageSource(t.img);
   return t;
+}
+function drawSatTileSk(canvas, img, tx, ty, z) {
+  const eW = lonToE(tileXToLon(tx, z)), eE = lonToE(tileXToLon(tx + 1, z));
+  const nN = latToN(tileYToLat(ty, z)), nS = latToN(tileYToLat(ty + 1, z));
+  drawImageWorldSk(canvas, img, eW, nS, eE, nN, CK.FilterMode.Linear);
 }
 function drawSatelliteSk(canvas) {
   if (!satEnabled || (!originLat && !originLon)) return;
@@ -5984,13 +6045,23 @@ function drawSatelliteSk(canvas) {
   const xMin = lonToTileX(lonW, z), xMax = lonToTileX(lonE, z);
   const yMin = latToTileY(latN, z), yMax = latToTileY(latS, z); // y grows southward
   if ((xMax - xMin) > 40 || (yMax - yMin) > 40 || xMax < xMin || yMax < yMin) return; // sanity
+  // A tile not drawn yet shows its nearest loaded ancestor, each drawn once and under
+  // the loaded tiles. Ancestors are only fetched for a tile Bing has none of; while a
+  // tile loads, whatever is already cached stands in.
+  const fill = new Map(), ready = [];
   for (let tx = xMin; tx <= xMax; tx++) for (let ty = yMin; ty <= yMax; ty++) {
     const t = getSatTile(tx, ty, z);
-    if (!t.skImg) continue;
-    const eW = lonToE(tileXToLon(tx, z)), eE = lonToE(tileXToLon(tx + 1, z));
-    const nN = latToN(tileYToLat(ty, z)), nS = latToN(tileYToLat(ty + 1, z));
-    drawImageWorldSk(canvas, t.skImg, eW, nS, eE, nN, CK.FilterMode.Linear);
+    if (t.skImg) { ready.push([t.skImg, tx, ty]); continue; }
+    for (let up = 1; up <= SAT_FILL_LEVELS && z - up >= 1; up++) {
+      const px = tx >> up, py = ty >> up, pz = z - up, key = pz + '/' + px + '/' + py;
+      const p = t.none ? getSatTile(px, py, pz) : satTiles.get(key);
+      if (p && p.skImg) { fill.set(key, [p.skImg, px, py, pz]); break; }
+      if (t.none && !p.none) break; // still loading
+    }
   }
+  [...fill.values()].sort((a, b) => a[3] - b[3])
+    .forEach(([img, px, py, pz]) => drawSatTileSk(canvas, img, px, py, pz));
+  for (const [img, tx, ty] of ready) drawSatTileSk(canvas, img, tx, ty, z);
 }
 // Coverage offscreen → SkImage, re-snapshotted only when the cell grid changed
 // (cov.dirty). The world blit uses Linear (bilinear) sampling so the cell-grid edge

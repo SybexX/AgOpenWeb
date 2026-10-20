@@ -57,6 +57,7 @@ AgOpenWeb3/
 │   ├── AgOpenWeb.Models.Tests/     # Geometry, coordinate conversion
 │   ├── AgOpenWeb.Services.Tests/   # NMEA parsing, guidance, coverage, pipeline
 │   ├── AgOpenWeb.ViewModels.Tests/ # ViewModel/control-brain logic
+│   ├── AgOpenWeb.RemoteServer.Tests/ # Web host: satellite tiles, imagery capture
 │   └── AgOpenWeb.IntegrationTests/ # Test-support lib: fake settings etc. (used by Services.Tests)
 │
 ├── Tools/                              # Dev scripts (i18n-extract.py, unpack-dump.sh, ...)
@@ -107,7 +108,7 @@ dotnet build Platforms/AgOpenWeb.Android/AgOpenWeb.Android.csproj
 dotnet build AgOpenWeb.sln
 
 # Run tests
-dotnet test Tests/AgOpenWeb.Models.Tests/ ; dotnet test Tests/AgOpenWeb.Services.Tests/ ; dotnet test Tests/AgOpenWeb.ViewModels.Tests/
+dotnet test Tests/AgOpenWeb.Models.Tests/ ; dotnet test Tests/AgOpenWeb.Services.Tests/ ; dotnet test Tests/AgOpenWeb.ViewModels.Tests/ ; dotnet test Tests/AgOpenWeb.RemoteServer.Tests/
 ```
 
 ## Key Design Decisions
@@ -350,6 +351,7 @@ bench scripts: `Tools/rtcm-bench`.
 - Use dependency injection for services
 - Use shared `GeometryMath` utilities instead of duplicating distance/angle calculations
 - Anything written to disk or a wire uses `CultureInfo.InvariantCulture` (see `CONTRIBUTING.md`)
+- New `.cs`/`.js`/`.py`/`.sh` files start with the Apache 2.0 header (`// SPDX-License-Identifier: Apache-2.0`, see `CONTRIBUTING.md`); `Tools/license-headers.py` adds it, CI checks it
 
 ## Testing
 
@@ -357,6 +359,7 @@ bench scripts: `Tools/rtcm-bench`.
 dotnet test Tests/AgOpenWeb.Models.Tests/
 dotnet test Tests/AgOpenWeb.Services.Tests/
 dotnet test Tests/AgOpenWeb.ViewModels.Tests/
+dotnet test Tests/AgOpenWeb.RemoteServer.Tests/
 
 # Legacy guidance algorithm test harness
 dotnet run --project TestRunner/TestRunner.csproj
@@ -366,9 +369,10 @@ dotnet run --project TestRunner/TestRunner.csproj
 - `AgOpenWeb.Models.Tests` - GeometryMath, GeoConversion, boundary/curve utilities
 - `AgOpenWeb.Services.Tests` - NMEA parsing, TrackGuidanceService, coverage, pipeline, U-turn (uses the virtual UDP modules in `Simulators/AgOpenWeb.VirtualModules`)
 - `AgOpenWeb.ViewModels.Tests` - ViewModel / control-brain logic
+- `AgOpenWeb.RemoteServer.Tests` - web host: Bing tile replies, boundary imagery capture
 - `AgOpenWeb.IntegrationTests` - test-support library (fake settings etc.); not a standalone test run
 
-CI also runs `Tools/i18n-extract.py --check` so `en.json` stays current.
+CI also runs `Tools/i18n-extract.py --check` so `en.json` stays current, and `Tools/license-headers.py --check` for the licence headers.
 
 ## U-Turn System
 
@@ -393,7 +397,8 @@ Two GitHub Actions workflows, split by purpose:
   compile-check of each platform head (Desktop, Android, iOS). No packaging, no releases.
 - **`build-deploy-bundles.yml`** — the single packaging + release publisher. Runs the
   `deploy/{linux,windows,macos}/package.sh` scripts + builds the signed Android APK on clean runners:
-  - on a **`v*` tag** (or manual dispatch with a tag) → publishes one complete Release with every
+  - on a **`v*` tag** (or manual dispatch with a tag) → publishes one complete Release, marked
+    prerelease so it never shows as "Latest" (the nightly is the build users run), with every
     artifact: Linux daemon (x64/arm64) + desktop launcher (x64/arm64) tarballs, Windows zip
     (launcher + service installer), macOS `.dmg`, and the Android APK;
   - on a **daily schedule** → refreshes a rolling `nightly` prerelease with the same artifacts;

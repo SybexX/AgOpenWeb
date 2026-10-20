@@ -1,18 +1,6 @@
 // AgOpenWeb
 // Copyright (C) 2024-2025 AgOpenWeb Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Buffers.Text;
@@ -391,10 +379,12 @@ public class NmeaParserServiceFast
         {
             state.Roll = rawRoll * 0.1;
             ApplyAhrsRollCalibration(ref state.Roll, configStore);
+            state.RollValid = true;
         }
         else
         {
             state.Roll = 0;
+            state.RollValid = false;
         }
 
         DecodeAogAttitudeFields(data, commas, ref state);
@@ -433,10 +423,12 @@ public class NmeaParserServiceFast
         {
             Utf8Parser.TryParse(rollField, out state.Roll, out _);
             ApplyAhrsRollCalibration(ref state.Roll, configStore);
+            state.RollValid = true;
         }
         else
         {
             state.Roll = 0;
+            state.RollValid = false;
         }
 
         DecodeAogAttitudeFields(data, commas, ref state);
@@ -596,10 +588,12 @@ public class NmeaParserServiceFast
             && Utf8Parser.TryParse(rollField, out state.Roll, out _))
         {
             ApplyAhrsRollCalibration(ref state.Roll, configStore);
+            state.RollValid = true;
         }
         else
         {
             state.Roll = 0;
+            state.RollValid = false;
         }
 
         // Satellites
@@ -895,8 +889,12 @@ public class NmeaParserServiceFast
         state.ImuValid = false;
 
         state.Roll = 0;
+        state.RollValid = false;
         if (Utf8Parser.TryParse(GetField(body, commas, INS_ROLL), out state.Roll, out _))
+        {
             ApplyAhrsRollCalibration(ref state.Roll, configStore);
+            state.RollValid = true;
+        }
         state.Pitch = 0;
         Utf8Parser.TryParse(GetField(body, commas, INS_PITCH), out state.Pitch, out _);
         state.YawRate = 0;

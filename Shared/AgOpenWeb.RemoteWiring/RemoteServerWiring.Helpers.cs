@@ -1,3 +1,7 @@
+// AgOpenWeb
+// Copyright (C) 2024-2026 AgOpenWeb Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Helpers for RemoteServerWiring.Wire — moved verbatim from the Desktop App class so
 // every host (Desktop/headless/iOS/Android) shares one web-command→VM/service mapping.
 using System;
@@ -14,7 +18,7 @@ public static partial class RemoteServerWiring
     {
         "track.drawStraight", "track.drawCurve", "track.drawPoint", "track.drawFinish",
         "track.drawUndo", "track.drawCancel", "track.aPlus", "track.driveAB",
-        "track.latLonHeading", "track.latLonAB",
+        "track.latLonHeading", "track.latLonAB", "track.refSide",
         "track.recordCurve", "track.finishCurve", "track.setABGps",
         "track.createFromBoundary", "track.boundaryCurve", "track.boundaryCurveSeg", "track.allEdges",
         "track.setVisible", "track.toggleRecPaths", "track.editSave",

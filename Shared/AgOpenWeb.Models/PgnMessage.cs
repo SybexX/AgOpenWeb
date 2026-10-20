@@ -1,18 +1,6 @@
 // AgOpenWeb
 // Copyright (C) 2024-2025 AgOpenWeb Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: Apache-2.0
 
 namespace AgOpenWeb.Models;
 
@@ -125,6 +113,15 @@ public class PgnMessage
 /// </summary>
 public static class PgnNumbers
 {
+    /// <summary>
+    /// External IMU data (0xD3 = 211): heading ×10, roll ×10, angular velocity, all int16 LE
+    /// from byte 5 (AgOpenGPS UDPComm case 0xD3) (#353).
+    /// </summary>
+    public const byte IMU_DATA = 211;
+
+    /// <summary>External IMU disconnected (0xD4 = 212): byte 5 = 1 (AgOpenGPS case 0xD4) (#353).</summary>
+    public const byte IMU_DISCONNECT = 212;
+
     /// <summary>
     /// Hardware message from a module (0xDD = 221): text shown on screen for N seconds
     /// (AgOpenGPS UDPComm case 221) (#110).

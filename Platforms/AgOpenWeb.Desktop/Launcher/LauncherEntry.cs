@@ -1,18 +1,6 @@
 // AgOpenWeb
 // Copyright (C) 2024-2025 AgOpenWeb Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Diagnostics;
@@ -77,10 +65,15 @@ internal static class LauncherEntry
     }
 
     /// <summary>Closing the window must stop the backend first so its save runs. Photino asks
-    /// before closing: cancel, stop off the UI thread, then close for real.</summary>
+    /// before closing: confirm (a stray click on X mid-job, #348), cancel, stop off the UI
+    /// thread, then close for real.</summary>
     public static bool StopThenClose(PhotinoWindow window, BackendHost? backend, ref bool closing)
     {
         if (backend is not { IsRunning: true } || closing) return false; // let it close
+        // Same wording as the Android head's Back prompt
+        if (window.ShowMessage("Exit AgOpenWeb?", "Guidance stops, and other devices lose the web view.",
+                PhotinoDialogButtons.YesNo, PhotinoDialogIcon.Question) != PhotinoDialogResult.Yes)
+            return true; // stay open
         closing = true;
         _ = Task.Run(async () =>
         {

@@ -1,10 +1,6 @@
 // AgOpenWeb
 // Copyright (C) 2024-2025 AgOpenWeb Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Linq;
@@ -195,6 +191,10 @@ public static partial class RemoteServerWiring
                                 case "track.aPlus": // Quick AB. arg = heading in degrees, or empty for
                                     // the vehicle's heading (#335). Ungated, like the other creators.
                                     vm.CreateAPlusLine(double.TryParse(arg, num, inv, out var apd) ? apd : null);
+                                    return;
+                                case "track.refSide": // Quick AB. arg = left|right: the side of a driven
+                                    // line its first pass lies on; sent before A+ / Drive AB / Curve (#345)
+                                    vm.TrackRefSideRight = arg != "left";
                                     return;
                                 case "track.latLonHeading": // Quick AB. arg = "lat,lon,heading" (#335)
                                 case "track.latLonAB":      // Quick AB. arg = "latA,lonA,latB,lonB" (#335)

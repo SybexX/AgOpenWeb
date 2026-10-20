@@ -20,7 +20,11 @@ permissions:
   contents: read   # CI only — no releases here
 
 env:
-  DOTNET_VERSION: '10.0.x'
+  # Pinned: workload set 10.0.402.1 names an iOS manifest (27.1.10018) that is not
+  # on NuGet yet, so 'dotnet workload install android' fails. Back to 10.0.x and drop
+  # ANDROID_WORKLOAD_VERSION once that is published.
+  DOTNET_VERSION: '10.0.401'
+  ANDROID_WORKLOAD_VERSION: '10.0.401.1'
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
@@ -38,9 +42,14 @@ jobs:
       - name: Check translation source is up to date
         run: python3 Tools/i18n-extract.py --check
 
+      # Apache 2.0 header in every source file; no other licence named anywhere.
+      - name: Check licence headers
+        run: python3 Tools/license-headers.py --check
+
       # Language files are translated on Weblate; a PR edits only the English source.
+      # Weblate's own PRs (from its fork, as the weblate user) are how they arrive.
       - name: Check language files are untouched
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'weblate'
         run: |
           git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
           changed=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD -- 'Shared/AgOpenWeb.RemoteServer/wwwroot/i18n/*.json' | grep -v '/en\.json$' || true)
@@ -65,6 +74,9 @@ jobs:
 
       - name: Run ViewModels Tests
         run: dotnet test Tests/AgOpenWeb.ViewModels.Tests/ --verbosity normal
+
+      - name: Run RemoteServer Tests
+        run: dotnet test Tests/AgOpenWeb.RemoteServer.Tests/ --verbosity normal
 
       - name: Run Guidance Algorithm Tests
         run: dotnet run --project TestRunner/TestRunner.csproj
@@ -106,7 +118,7 @@ jobs:
       - name: Install Android workload
         run: |
           for i in 1 2 3; do
-            dotnet workload install android && break
+            dotnet workload install android --version "$ANDROID_WORKLOAD_VERSION" && break
             echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done

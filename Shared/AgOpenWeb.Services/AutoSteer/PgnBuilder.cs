@@ -1,18 +1,6 @@
 // AgOpenWeb
 // Copyright (C) 2024-2025 AgOpenWeb Contributors
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Buffers;
@@ -627,8 +615,8 @@ public static class PgnBuilder
     /// Format: [0x80, 0x81, Source, 0xFD, 8, AngleLo, AngleHi, HeadingLo, HeadingHi, RollLo, RollHi, Switches, PWM, CRC]
     ///
     /// Byte 5-6:  Actual steer angle * 100 (signed int16, little-endian)
-    /// Byte 7-8:  Heading from IMU * 0.1 (signed int16, little-endian)
-    /// Byte 9-10: Roll from IMU * 0.1 (signed int16, little-endian)
+    /// Byte 7-8:  Heading from IMU * 0.1 (signed int16, little-endian); 9999 = no IMU
+    /// Byte 9-10: Roll from IMU * 0.1 (signed int16, little-endian); 8888 = no IMU
     /// Byte 11:   Switch status byte
     ///            bit 0: Work switch (INVERTED: 0=ON, 1=OFF)
     ///            bit 1: Steer switch active
@@ -662,15 +650,17 @@ public static class PgnBuilder
         short angleRaw = (short)(data[5] | (data[6] << 8));
         double actualSteerAngle = angleRaw / 100.0;
 
-        // Parse IMU heading (signed int16, heading * 0.1) - deprecated, GNSS supplies this now
-        // Little-endian: low byte first
+        // Parse IMU heading (signed int16, heading * 0.1; 9999 = no IMU). AgOpenGPS uses it
+        // when the GPS sentence carries no IMU heading. Little-endian: low byte first
         short headingRaw = (short)(data[7] | (data[8] << 8));
         double imuHeading = headingRaw * 0.1;
+        bool hasImuHeading = headingRaw != 9999;
 
-        // Parse IMU roll (signed int16, roll * 0.1) - deprecated, GNSS supplies this now
-        // Little-endian: low byte first
+        // Parse IMU roll (signed int16, roll * 0.1; 8888 = no IMU). AgOpenGPS uses it
+        // when the GPS sentence carries no roll (#353). Little-endian: low byte first
         short rollRaw = (short)(data[9] | (data[10] << 8));
         double imuRoll = rollRaw * 0.1;
+        bool hasImuRoll = rollRaw != 8888;
 
         // Parse switch status byte (byte 11)
         // Bit 0: Work switch (INVERTED: 1=OFF, 0=ON)
@@ -694,7 +684,9 @@ public static class PgnBuilder
             steerSwitchActive,
             remoteButton,
             vwasFusionActive,
-            pwmDisplay);
+            pwmDisplay,
+            hasImuRoll,
+            hasImuHeading);
 
         return true;
     }
@@ -706,6 +698,25 @@ public static class PgnBuilder
     public static bool TryParseSteerData(byte[] data, out SteerModuleData result)
     {
         return TryParseSteerData(data.AsSpan(), out result);
+    }
+
+    #endregion
+
+    #region PGN 211 Parser (External IMU)
+
+    /// <summary>
+    /// Parse PGN 211 (0xD3, external IMU) as AgOpenGPS does: 14 bytes, heading ×10 at
+    /// bytes 5-6 and roll ×10 at bytes 7-8 (signed int16, little-endian). Roll is
+    /// uncalibrated.
+    /// </summary>
+    public static bool TryParseImuData(ReadOnlySpan<byte> data, out double headingDegrees, out double rollDegrees)
+    {
+        headingDegrees = rollDegrees = 0;
+        if (data.Length != 14 || data[0] != HEADER1 || data[1] != HEADER2 || data[3] != PgnNumbers.IMU_DATA)
+            return false;
+        headingDegrees = (short)(data[5] | (data[6] << 8)) * 0.1;
+        rollDegrees = (short)(data[7] | (data[8] << 8)) * 0.1;
+        return true;
     }
 
     #endregion
