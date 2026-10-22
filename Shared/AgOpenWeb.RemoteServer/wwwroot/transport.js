@@ -260,8 +260,8 @@ window.RemoteTransport = {
           for (let k = 0; k < hc; k++) hotkeys[k] = { action: str(), key: str(), label: str() };
           const gc = i32(); const logs = new Array(gc);
           for (let k = 0; k < gc; k++) logs[k] = { time: str(), level: i32(), message: str() };
-          const bugReportStatus = str();
-          handlers.onAppInfo && handlers.onAppInfo({ version, gitHash, currentLanguage, languages, directories, hotkeys, logs, bugReportStatus });
+          const bugReportStatus = str(), bugReportSendStatus = str();
+          handlers.onAppInfo && handlers.onAppInfo({ version, gitHash, currentLanguage, languages, directories, hotkeys, logs, bugReportStatus, bugReportSendStatus });
           break;
         }
         case TYPE.FIELD_TOOLS: {
@@ -299,6 +299,7 @@ window.RemoteTransport = {
           const vehicle = {
             name: str(), type: i32(), hitchType: i32(), hitchLength: f64(), wheelbase: f64(),
             trackWidth: f64(), antennaPivot: f64(), antennaHeight: f64(), antennaOffset: f64(),
+            imuPivot: f64(), imuHeight: f64(), imuOffset: f64(),
           };
           const gps = {
             isDualGps: !!u8(), dualHeadingOffset: f64(), dualReverseDistance: f64(),
@@ -333,7 +334,7 @@ window.RemoteTransport = {
             uTurnButtonVisible: !!u8(), lateralButtonVisible: !!u8(),
             autoSteerSound: !!u8(), uTurnSound: !!u8(), hydraulicSound: !!u8(), sectionsSound: !!u8(),
             keyboardEnabled: !!u8(), startFullscreen: !!u8(), elevationLogEnabled: !!u8(),
-            resolutionMultiplier: f64(), isDayMode: !!u8(),
+            resolutionMultiplier: f64(), isDayMode: !!u8(), uiScale: i32(),
           };
           // AutoSteer config — full 9-tab surface (positional, matches WireCodec).
           const autosteer = {

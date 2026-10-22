@@ -1051,7 +1051,7 @@ public sealed class GpsPipelineService : IGpsPipelineService
         {
             var config2 = _configStore;
             double widthMinusOverlap = config2.ActualToolWidth - config2.Tool.Overlap;
-            double distAway = widthMinusOverlap * passNumber + nudgeOffset;
+            double distAway = Models.Track.PassGeometry.Offset(track, passNumber, widthMinusOverlap, nudgeOffset);
 
             // Curve tracks: extend the displayed (magenta) line straight to the U-turn so
             // there's no visible gap between the guidance line and the turn (the line the
@@ -1206,7 +1206,7 @@ public sealed class GpsPipelineService : IGpsPipelineService
                 // stale baseTrack set by the earlier block (when incoming passNumber
                 // was non-zero) stays pointing at the reference track, and the UI
                 // renders baseTrack + displayTrack at the same position (overlap).
-                baseTrack = nearestPass != 0 ? track : null;
+                baseTrack = ReferenceEquals(nearestDisplayTrack, track) ? null : track;
 
                 // #95: show where Pure Pursuit would aim if engaged now, so the operator
                 // can see the target (field vs. ditch) before engaging.
@@ -1260,10 +1260,15 @@ public sealed class GpsPipelineService : IGpsPipelineService
             data.SatellitesInUse, data.Hdop,
             driftedEasting, driftedNorthing);
 
-        // ── (9b) PGN 100 corrected position ─────────────────────────────
+        // ── (9b) PGN 100 corrected position, PGN 214 GPS data ───────────
         // AgOpenGPS sends pn.fix: the antenna with antenna offset, roll and drift applied
         // but not moved back to the pivot. Undo the fore/aft step of the transform above.
-        // Off unless ticked on the Network IO card.
+        // PGN 214 is the fix as it came in, which AgIO sends after parsing each sentence;
+        // GPS_Out takes speed, heading and fix quality from it (#364). AgIO only has real
+        // receivers; it goes out for the simulator too, so GPS_Out works in sim.
+        // Both off unless ticked on the Network IO card.
+        if (_configStore.Connections.SendCorrectedPosition)
+            _autoSteerService.SendGpsData(data);
         if (_configStore.Connections.SendCorrectedPosition && headingPlane != null && data.FixQuality > 0)
         {
             double fixE = driftedEasting + Math.Sin(headingRad) * _configStore.Vehicle.AntennaPivot;
@@ -1521,7 +1526,7 @@ public sealed class GpsPipelineService : IGpsPipelineService
 
         // Calculate parallel offset
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double distAway = widthMinusOverlap * passNumber + nudgeOffset;
+        double distAway = Models.Track.PassGeometry.Offset(track, passNumber, widthMinusOverlap, nudgeOffset);
 
         if (_cycleCounter % 50 == 0)
         {
@@ -1806,12 +1811,12 @@ public sealed class GpsPipelineService : IGpsPipelineService
         // cross-track error from the tractor position). See #261.
         double sampleDist = CalculatePerpendicularDistance(track, sampleEasting, sampleNorthing);
 
-        // Match AgOpen CABLine.BuildCurrentABLineList — subtract the accumulated nudge
-        // before rounding to the nearest pass. Without this, nudging the line perpendicular
-        // can cause the auto-select to fight the nudge each cycle.
-        double refDist = (sampleDist - nudgeOffset) / widthMinusOverlap;
-        int nearestPass = refDist < 0 ? (int)(refDist - 0.5) : (int)(refDist + 0.5);
-        double distAway = widthMinusOverlap * nearestPass + nudgeOffset;
+        // Match AgOpen CABLine.BuildCurrentABLineList — subtract the accumulated nudge (and
+        // the half width between the reference line and pass 0) before rounding to the
+        // nearest pass. Without the nudge, nudging the line perpendicular can cause the
+        // auto-select to fight the nudge each cycle.
+        int nearestPass = Models.Track.PassGeometry.Nearest(track, sampleDist, widthMinusOverlap, nudgeOffset);
+        double distAway = Models.Track.PassGeometry.Offset(track, nearestPass, widthMinusOverlap, nudgeOffset);
 
         Models.Track.Track? resultTrack = null;
         if (Math.Abs(distAway) < 0.01)

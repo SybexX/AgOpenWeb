@@ -124,9 +124,9 @@ host does the same for the 100 Hz control loop.
 
 ### Control authority
 Several browsers may be connected; only one holds control (`ControlAuthority`, deadman model).
-Commands that actuate (autosteer, sections, U-turn, simulator) are Tier-2 and dropped unless
-the sender holds fresh control; everything else is Tier-1. A client can't take control from a
-live operator, only fill an empty seat.
+Every command is dropped unless the sender holds fresh control: the others are observers, who
+see everything and change nothing (#397). `ObserverIds` lists the few requests an observer may
+send. A client can't take control from a live operator, only fill an empty seat.
 
 ### Host ↔ client commands
 The client sends `id|arg` strings (`transport.send('track.select|0')`). `RemoteServerWiring`
@@ -249,6 +249,7 @@ Services use interface-based design in `Shared/AgOpenWeb.Services/Interfaces/`:
 - `IGpsService` - GPS data processing and position updates
 - `IUdpCommunicationService` - UDP communication with AgOpenGPS modules
 - `INtripClientService` - NTRIP caster connections for RTK
+- `INetworkWatcher` - the one place that notices network changes (plus a 30 s heartbeat); UDP discovery, NTRIP retry and the bug report outbox subscribe in that order
 - `IFieldService` - Field loading/saving/management
 - `IBoundaryRecordingService` - Recording field boundaries
 - `IMapService` - Historical map hook; every head registers `NullMapService` (the web client renders)
@@ -296,7 +297,7 @@ to the system browser, keep the screen awake, localhost HTTP) is listed in
 ### Adding a web command
 1. In `app.js`, send it: `transport.send('mything.do|' + arg)`.
 2. Route it in `RemoteServerWiring.cs` (or a `config.set` key in `RemoteServerWiring.Helpers.cs`) to a VM method or command.
-3. If it actuates (steering, sections, turns), add it to the Tier-2 list so it needs control.
+3. It needs control automatically; add it to `ObserverIds` only if it changes nothing.
 
 ### Showing new state in the client
 1. Add it to the DTO in `Contracts.cs`, fill it in `SceneProjector` (or the relevant projector).
@@ -372,7 +373,7 @@ dotnet run --project TestRunner/TestRunner.csproj
 - `AgOpenWeb.RemoteServer.Tests` - web host: Bing tile replies, boundary imagery capture
 - `AgOpenWeb.IntegrationTests` - test-support library (fake settings etc.); not a standalone test run
 
-CI also runs `Tools/i18n-extract.py --check` so `en.json` stays current, and `Tools/license-headers.py --check` for the licence headers.
+CI also runs `Tools/i18n-extract.py --check` so `en.json` stays current, `Tools/license-headers.py --check` for the licence headers, and `Tools/i18n-limits.py --check` (job `translations-fit`) so every translated label fits the English layout.
 
 ## U-Turn System
 

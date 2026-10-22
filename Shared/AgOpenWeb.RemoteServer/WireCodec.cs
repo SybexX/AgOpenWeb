@@ -169,6 +169,7 @@ public static class WireCodec
         w.Write(a.Logs.Count);
         foreach (var lg in a.Logs) { WriteStr(w, lg.Time); w.Write(lg.Level); WriteStr(w, lg.Message); }
         WriteStr(w, a.BugReportStatus);
+        WriteStr(w, a.BugReportSendStatus);
         return ms.ToArray();
     }
 
@@ -276,6 +277,9 @@ public static class WireCodec
         w.Write(v.AntennaPivot);
         w.Write(v.AntennaHeight);
         w.Write(v.AntennaOffset);
+        w.Write(v.ImuPivot);
+        w.Write(v.ImuHeight);
+        w.Write(v.ImuOffset);
         var g = c.Gps;
         w.Write((byte)(g.IsDualGps ? 1 : 0));
         w.Write(g.DualHeadingOffset);  // f64
@@ -365,6 +369,7 @@ public static class WireCodec
         DB(d.KeyboardEnabled); DB(d.StartFullscreen); DB(d.ElevationLogEnabled);
         w.Write(d.DisplayResolutionMultiplier); // f64 — web imagery LOD (quality)
         DB(d.IsDayMode); // day/night theme — web switches its full palette + map colours
+        w.Write(d.UiScale); // i32 — UI size, percent
 
         // AutoSteer config tab (full 9-tab surface). Append-only; field order mirrors
         // AutoSteerConfigDto exactly so transport.js decodes it positionally.
