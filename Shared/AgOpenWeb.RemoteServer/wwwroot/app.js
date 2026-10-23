@@ -3741,19 +3741,105 @@ function renderBugReport() {
     : '';
   brIssueUrl = issueUrl || null;
   document.getElementById('br-openissue').style.display = brIssueUrl ? '' : 'none';
-  document.getElementById('br-send').disabled = ['sending', 'queued', 'sent', 'accepted'].includes(kind);
+  brSendBusy = ['sending', 'queued', 'sent', 'accepted'].includes(kind);
+  if (brFile !== brFilesFor) { brFiles = []; brFilesFor = brFile; renderBrFiles(); }
+  document.getElementById('br-attach').disabled = brSendBusy || brAttaching;
+  brUpdateSend();
 }
-let brIssueUrl = null;
-try { document.getElementById('br-ghuser').value = localStorage.getItem('agopenweb.bugReportGitHub') || ''; } catch (_) { }
+// Screenshots and files: each one is posted to the host as it is picked and goes into the
+// dump under attachments/ (BugReportAttachments). Only the screen holding control may add.
+let brFiles = [], brFilesFor = null, brAttaching = false;
+const brSize = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+function renderBrFiles() {
+  const box = document.getElementById('br-files'); box.innerHTML = '';
+  for (const f of brFiles) {
+    const row = document.createElement('div'); row.className = 'br-filerow';
+    const nm = document.createElement('span'); nm.className = 'br-fname'; nm.textContent = f.name; nm.translate = false;
+    const sz = document.createElement('span'); sz.className = 'br-fsize'; sz.textContent = brSize(f.size);
+    const x = document.createElement('button'); x.className = 'ln-x'; x.textContent = '✕'; x.title = tr('Remove');
+    x.disabled = brSendBusy;
+    x.addEventListener('pointerdown', e => { e.stopPropagation(); brChangeFiles('detach', f.name, new Uint8Array(0)); });
+    row.append(nm, sz, x); box.appendChild(row);
+  }
+}
+async function brChangeFiles(op, name, body) {
+  const st = document.getElementById('br-attachstatus');
+  const q = new URLSearchParams({ zip: brFile, name, client: myClientId || '' });
+  let res, reply = null;
+  try {
+    res = await fetch('/bugreports/' + op + '?' + q, { method: 'POST', body });
+    if (res.ok) reply = await res.json();
+  } catch (_) { st.textContent = tr('Could not add {name}', { name }); return false; }
+  if (res.status === 403) { st.textContent = tr('View only: another screen has control'); return false; }
+  if (res.status === 413) { st.textContent = tr('{name} is too large (20 MB at most)', { name }); return false; }
+  if (!reply) { st.textContent = tr('Could not add {name}', { name }); return false; }
+  const why = {
+    TooLarge: tr('{name} is too large (20 MB at most)', { name }),
+    TotalTooLarge: tr('Attachments are limited to 25 MB in all'),
+    TooMany: tr('At most 10 attachments'),
+    Empty: tr('{name} is empty', { name }),
+    Busy: tr('The report is being sent; try again in a moment'),
+  }[reply.refusal];
+  if (reply.refusal !== 'Busy') { brFiles = reply.files; renderBrFiles(); }
+  st.textContent = why || tr('Like the rest of the report, attachments go only to the maintainers.');
+  return !why;
+}
+document.getElementById('br-attach').addEventListener('click', e => {
+  e.stopPropagation();
+  if (brFile && !brSendBusy && !brAttaching) document.getElementById('br-file').click();
+});
+document.getElementById('br-file').addEventListener('change', async e => {
+  const picked = [...e.target.files]; e.target.value = '';
+  if (!picked.length || !brFile) return;
+  brAttaching = true; document.getElementById('br-attach').disabled = true;
+  for (const f of picked) {
+    document.getElementById('br-attachstatus').textContent = tr('Adding {name}…', { name: f.name });
+    if (f.size > 20 * 1048576) { document.getElementById('br-attachstatus').textContent = tr('{name} is too large (20 MB at most)', { name: f.name }); break; }
+    if (!await brChangeFiles('attach', f.name, f)) break;
+  }
+  brAttaching = false; document.getElementById('br-attach').disabled = brSendBusy;
+});
+let brIssueUrl = null, brSendBusy = false;
+// Send needs what the bug report service checks too (Tools/bugreport-worker reports.js):
+// a title and description long enough to act on, and a GitHub username or an email to reply
+// to. Create needs nothing: it captures the moment.
+const BR_MIN_TITLE = 15, BR_MIN_DESC = 40;
+const brOne = id => document.getElementById(id).value.replace(/\t/g, ' ').trim();
+const brChars = s => [...s].length;
+function brMissing() {
+  const t = BR_MIN_TITLE - brChars(brOne('br-title'));
+  if (t > 0) return tr('Title: {n} more characters', { n: t });
+  const d = BR_MIN_DESC - brChars(document.getElementById('br-desc').value.trim());
+  if (d > 0) return tr('Description: {n} more characters', { n: d });
+  const gh = brOne('br-ghuser').replace(/^@/, ''), em = brOne('br-email');
+  if (gh && !/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(gh)) return tr('Not a GitHub username');
+  if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return tr('Not an email address');
+  if (!gh && !em) return tr('Add your GitHub username or email so we can reply');
+  return '';
+}
+function brUpdateSend() {
+  const need = brMissing();
+  document.getElementById('br-need').textContent = brSendBusy ? '' : need;
+  document.getElementById('br-send').disabled = brSendBusy || !!need;
+}
+for (const id of ['br-title', 'br-desc', 'br-ghuser', 'br-email'])
+  document.getElementById(id).addEventListener('input', brUpdateSend);
+try {
+  document.getElementById('br-ghuser').value = localStorage.getItem('agopenweb.bugReportGitHub') || '';
+  document.getElementById('br-email').value = localStorage.getItem('agopenweb.bugReportEmail') || '';
+} catch (_) { }
 document.getElementById('br-send').addEventListener('pointerdown', e => {
   e.stopPropagation();
-  if (!brFile) return;
-  const one = id => document.getElementById(id).value.replace(/\t/g, ' ').trim();
-  const gh = one('br-ghuser').replace(/^@/, '');
-  try { localStorage.setItem('agopenweb.bugReportGitHub', gh); } catch (_) { }
+  if (!brFile || brMissing()) return;
+  const gh = brOne('br-ghuser').replace(/^@/, ''), em = brOne('br-email');
+  try { localStorage.setItem('agopenweb.bugReportGitHub', gh); localStorage.setItem('agopenweb.bugReportEmail', em); } catch (_) { }
   document.getElementById('br-sendstatus').textContent = tr('Sending…');
   document.getElementById('br-send').disabled = true;
-  transport.send('app.bugReport.send|' + [brFile, gh, one('br-title'), document.getElementById('br-desc').value].join('\t'));
+  transport.send('app.bugReport.send|' + [brFile, gh, em, brOne('br-title'), document.getElementById('br-desc').value].join('\t'));
+});
+document.getElementById('br-docs').addEventListener('pointerdown', e => {
+  e.stopPropagation();
+  openExternal('https://docs.agopengps.com/');
 });
 document.getElementById('br-openissue').addEventListener('pointerdown', e => {
   e.stopPropagation();
