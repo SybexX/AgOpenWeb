@@ -37,18 +37,20 @@ public static class PgnBuilder
     public const byte PGN_GPS_DATA = 0xD6;       // 214 - AgIO's GPS data (GPS_Out)
     public const byte SOURCE_GPS = 0x7C;         // AgIO sends PGN 214 as the GPS module
     public const byte PGN_VEHICLE_GEOMETRY = 0xF7; // 247 - Vehicle geometry (AgOpenWeb, #387)
+    public const byte PGN_SECTION_DIMENSIONS = 0xEB; // 235 - Section widths (rate controllers)
 
     // Buffer sizes: header(2) + source(1) + pgn(1) + length(1) + data(N) + crc(1)
     public const int AUTOSTEER_PGN_SIZE = 14;       // 5 header + 8 data + 1 crc
     public const int MACHINE_PGN_SIZE = 14;         // 5 header + 8 data + 1 crc
     public const int SECTIONS_64_PGN_SIZE = 16;     // 5 header + 10 data + 1 crc
     public const int STEER_SETTINGS_PGN_SIZE = 14;  // 5 header + 8 data + 1 crc
-    public const int STEER_CONFIG_PGN_SIZE = 11;    // 5 header + 5 data + 1 crc
+    public const int STEER_CONFIG_PGN_SIZE = 14;    // 5 header + 8 data (5 used, 3 zero, as AgOpenGPS pads it) + 1 crc
     public const int MACHINE_CONFIG_PGN_SIZE = 14;  // 5 header + 8 data + 1 crc
     public const int MACHINE_PINS_PGN_SIZE = 30;    // 5 header + 24 data + 1 crc
     public const int CORRECTED_POSITION_PGN_SIZE = 30; // 5 header + 24 data + 1 crc
     public const int GPS_DATA_PGN_SIZE = 57;        // 5 header + 51 data + 1 crc
     public const int VEHICLE_GEOMETRY_PGN_SIZE = 25; // 5 header + 19 data + 1 crc
+    public const int SECTION_DIMENSIONS_PGN_SIZE = 39; // 5 header + 33 data + 1 crc
     public const byte VEHICLE_GEOMETRY_VERSION = 1;
 
     // Thread-local buffers to avoid allocation
@@ -151,10 +153,11 @@ public static class PgnBuilder
             buf[8] = (byte)(angleInt & 0xFF);         // low byte
             buf[9] = (byte)(angleInt >> 8);           // high byte
 
-            // XTE - cross-track error (single byte, clamped to -127 to 127 cm)
-            int xte = (int)(state.CrossTrackError * 100); // meters to cm
-            xte = Math.Clamp(xte, -127, 127);
-            buf[10] = (byte)(sbyte)xte;
+            // XTE as AgOpenGPS sends it (Position.designer.cs): the distance in mm × 0.05, so half
+            // centimetres, clamped to ±127, plus 127; 255 with steering off or no guidance line
+            // (AgOpenGPS's 32020 / 32000). Used to go out as signed centimetres; no module reads
+            // the byte today (the AiO v26 and the Arduino v5 store it unused), but it is the wire format.
+            buf[10] = LineDistanceByte(ref state);
 
             // Section states (16 bits = 2 bytes)
             buf[11] = (byte)(state.SectionStates & 0xFF);         // Sections 1-8
@@ -162,6 +165,21 @@ public static class PgnBuilder
         }
 
         return WithCrc(buf);
+    }
+
+    /// <summary>
+    /// PGN 254 byte 10, AgOpenGPS's lightbar distance: mm × 0.05 clamped to ±127, plus 127, so 127
+    /// is on the line, 0 and 254 are 2.54 m or more either side; 255 means no line. The guidance
+    /// service's 32000 (no usable line) arrives as the cross-track error. The mm value is a short
+    /// as in AgOpenGPS, overflow included.
+    /// </summary>
+    private static byte LineDistanceByte(ref VehicleState state)
+    {
+        if (!state.IsAutoSteerEngaged || !state.GuidanceValid || Math.Abs(state.CrossTrackError) >= 32000)
+            return 255;
+        short mm = unchecked((short)Math.Round(state.CrossTrackError * 1000.0, MidpointRounding.AwayFromZero));
+        int distanceX2 = Math.Clamp((int)(mm * 0.05), -127, 127);
+        return (byte)(distanceX2 + 127);
     }
 
     /// <summary>
@@ -472,6 +490,35 @@ public static class PgnBuilder
     }
 
     /// <summary>
+    /// Build PGN 235 (0xEB) Section dimensions - AgOpenGPS's layout (CPGN_EB), sent when
+    /// the section count or widths change. Rate controllers read it to match their sections
+    /// to the tool's.
+    ///
+    /// Bytes 5-36: widths of sections 1-16 in cm, uint16 little-endian (0 past the last)
+    /// Byte 37:    number of sections (as AgOpenGPS, the count even above 16)
+    /// </summary>
+    public static byte[] BuildSectionDimensionsPgn(ToolConfig tool, int numSections)
+    {
+        var buf = new byte[SECTION_DIMENSIONS_PGN_SIZE];
+
+        buf[0] = HEADER1;
+        buf[1] = HEADER2;
+        buf[2] = SOURCE;
+        buf[3] = PGN_SECTION_DIMENSIONS;
+        buf[4] = 33;
+
+        for (int i = 0; i < 16 && i < numSections; i++)
+        {
+            int cm = Math.Clamp((int)Math.Round(tool.GetSectionWidth(i)), 0, ushort.MaxValue);
+            buf[5 + i * 2] = (byte)(cm & 0xFF);
+            buf[6 + i * 2] = (byte)((cm >> 8) & 0xFF);
+        }
+        buf[37] = (byte)Math.Clamp(numSections, 0, 255);
+
+        return WithCrc(buf);
+    }
+
+    /// <summary>
     /// Calculate CRC as sum of bytes (matching PgnMessage.CalculateCRC)
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -665,7 +712,8 @@ public static class PgnBuilder
 
     /// <summary>
     /// Build PGN 251 (Steer Config) from AutoSteerConfig.
-    /// Format: [0x80, 0x81, 0x7F, 0xFB, 5, set0, pulseCount, minSpeed, set1, angVel, CRC]
+    /// Format: [0x80, 0x81, 0x7F, 0xFB, 8, set0, pulseCount, minSpeed, set1, angVel, 0, 0, 0, CRC]
+    /// (AgOpenGPS's framing: a length of 8 with the last three data bytes zero; the modules read five)
     ///
     /// Byte 5 (set0):
     ///   bit 0: Invert WAS
@@ -683,7 +731,8 @@ public static class PgnBuilder
     ///   bit 2: Current Sensor
     ///   bit 3-4: IMU Axis Swap
     /// Byte 9:  Angular velocity
-    /// Byte 10: CRC
+    /// Byte 10-12: 0
+    /// Byte 13: CRC
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte[] BuildSteerConfigPgn(AutoSteerConfig config)
@@ -696,7 +745,7 @@ public static class PgnBuilder
         buf[1] = HEADER2;
         buf[2] = SOURCE;
         buf[3] = PGN_STEER_CONFIG;
-        buf[4] = 5;  // Data length
+        buf[4] = 8;  // Data length, as AgOpenGPS sends it
 
         // Set0 byte (use helper from config)
         buf[5] = config.GetSetting0Byte();
@@ -714,6 +763,11 @@ public static class PgnBuilder
 
         // Angular velocity (not currently used, set to 0)
         buf[9] = 0;
+
+        // AgOpenGPS pads the frame to 8 data bytes
+        buf[10] = 0;
+        buf[11] = 0;
+        buf[12] = 0;
 
         return WithCrc(buf);
     }

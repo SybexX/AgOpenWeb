@@ -53,6 +53,24 @@ public sealed class RemoteServerHost
     public void ShowHardwareMessage(string text, int seconds, bool warning)
         => _ = _ws?.BroadcastAsync(WireCodec.EncodeHardwareMessage(text, seconds, warning));
 
+    /// <summary>The VT card's frames for a client that just connected: its link state, the
+    /// pictures and the latest screen. Empty when the build has no terminal.</summary>
+    public Func<IReadOnlyList<byte[]>>? VtSeedProvider
+    {
+        get => _broadcaster?.VtSeedProvider;
+        set { _vtSeedProvider = value; if (_broadcaster is not null) _broadcaster.VtSeedProvider = value; }
+    }
+    private Func<IReadOnlyList<byte[]>>? _vtSeedProvider;
+
+    /// <summary>The VT card's frames to send since the last broadcast tick, in order (drained:
+    /// each call returns them once). Null or empty when there are none.</summary>
+    public Func<IReadOnlyList<byte[]>?>? VtFramesProvider
+    {
+        get => _broadcaster?.VtFramesProvider;
+        set { _vtFramesProvider = value; if (_broadcaster is not null) _broadcaster.VtFramesProvider = value; }
+    }
+    private Func<IReadOnlyList<byte[]>?>? _vtFramesProvider;
+
     /// <summary>Broadcast the Drive In pick list (#109). The browser that pressed Drive In
     /// shows it.</summary>
     public void ShowDrivePick(IReadOnlyList<FieldEntryDto> fields)
@@ -284,6 +302,8 @@ public sealed class RemoteServerHost
         _ws.IsRestrictedCommand = _isRestricted;
         _broadcaster.WizardProvider = _wizardProvider;
         _broadcaster.PromptProvider = _promptProvider;
+        _broadcaster.VtSeedProvider = _vtSeedProvider;
+        _broadcaster.VtFramesProvider = _vtFramesProvider;
         _broadcaster.RecordedPathProvider = _recordedPathProvider;
         _broadcaster.BoundaryProvider = _boundaryProvider;
         _broadcaster.ViewPrefsProvider = _viewPrefsProvider;
@@ -316,8 +336,11 @@ public sealed class RemoteServerHost
         // Force a fresh fetch every load.
         var noStore = new[] { ("Cache-Control", "no-store") };
         server.MapGet("/", () => SimpleWebServer.Response.Text(ReadAsset("index.html"), "text/html", noStore));
-        server.MapGet("/app.js", () => SimpleWebServer.Response.Text(ReadAsset("app.js"), "text/javascript", noStore));
         server.MapGet("/transport.js", () => SimpleWebServer.Response.Text(ReadAsset("transport.js"), "text/javascript", noStore));
+        // The client's scripts and styles, one file per feature (Docs/WEB_CLIENT.md).
+        // Filename-only (no path traversal); unknown names 404.
+        server.MapGetPrefix("/js/", file => ClientFile(file, ".js", "js.", "text/javascript", noStore));
+        server.MapGetPrefix("/css/", file => ClientFile(file, ".css", "css.", "text/css", noStore));
         // Translations (#143): the loader, and one JSON file per language (en.json is the
         // source Weblate reads). Filename-only (no path traversal); unknown names 404.
         server.MapGet("/i18n.js", () => SimpleWebServer.Response.Text(ReadAsset("i18n.js"), "text/javascript", noStore));
@@ -516,6 +539,16 @@ public sealed class RemoteServerHost
             return new WebImage(jpg, "image/jpeg");
         }
         catch { return null; }
+    }
+
+    private static SimpleWebServer.Response ClientFile(string file, string ext, string folder,
+        string contentType, (string, string)[] headers)
+    {
+        if (file.Contains('/') || file.Contains('\\') || file.Contains("..")
+            || !file.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+            return SimpleWebServer.Response.NotFound;
+        try { return SimpleWebServer.Response.Text(ReadAsset(folder + file), contentType, headers); }
+        catch (FileNotFoundException) { return SimpleWebServer.Response.NotFound; }
     }
 
     private static string ReadAsset(string name)

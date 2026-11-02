@@ -62,6 +62,7 @@ public sealed class YouTurnStateMachine
     // U-turn sound latches (AgOpenGPS turnTooCloseTrigger / isBoundAlarming) (#110).
     private bool _creationFailSounded, _approachAlarmed;
     private readonly YouTurnPathingService _pathing;
+    private readonly PolygonIndexCache _headlandIndex = new(); // the zone test, every GPS cycle
     private readonly ILogger<YouTurnStateMachine> _logger;
     private readonly ConfigurationStore _configStore;
 
@@ -71,6 +72,13 @@ public sealed class YouTurnStateMachine
     // planned again, a turn completes, or the track, nudge or cultivated area changes.
     private readonly Dictionary<int, bool> _coveredPasses = new();
     private (List<int>? Plan, Models.Track.Track? Track, double Nudge, Boundary? Boundary, IReadOnlyList<Vec3>? Headland) _coveredPassesKey;
+
+    // Which way the last turn stepped across the field (+1 to a higher pass, -1 lower) and on
+    // which track (by name: a nudge or edit makes a new Track). A normal turn keeps stepping that
+    // way, as AgOpenGPS does by flipping isTurnLeft after each turn, so the work goes on across
+    // the field and a swapped turn (the U-turn arrow) carries on to the new side (#523).
+    private int _lastStep;
+    private string? _lastStepTrack;
 
     public YouTurnStateMachine(
         YouTurnCreationService creation,
@@ -821,7 +829,9 @@ public sealed class YouTurnStateMachine
     {
         var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double nextDistAway = Models.Track.PassGeometry.Offset(track, nextPath, widthMinusOverlap);
+        // The next pass is driven the other way: the tool shift changes sign (#446).
+        double toolShift = Models.Track.PassGeometry.ToolShift(config.Tool.Offset, guidance.IsHeadingSameWay);
+        double nextDistAway = Models.Track.PassGeometry.Offset(track, nextPath, widthMinusOverlap, 0, -toolShift);
         int pathDiff = nextPath - guidance.HowManyPathsAway;
 
         // The planned path dictates pathDiff (snake / alternative), not the regular skip logic.
@@ -829,7 +839,7 @@ public sealed class YouTurnStateMachine
         bool positiveOffset = pathDiff > 0;
         turn.IsTurnLeft = positiveOffset ^ guidance.IsHeadingSameWay;
         turn.WasHeadingSameWayAtTurnStart = guidance.IsHeadingSameWay;
-        turn.NextTrackTurnOffset = Math.Abs(pathDiff) * widthMinusOverlap;
+        turn.NextTrackTurnOffset = Math.Abs(pathDiff * widthMinusOverlap + 2 * toolShift);
 
         var refA = track.Points[0];
         var refB = track.Points[track.Points.Count - 1];
@@ -940,8 +950,9 @@ public sealed class YouTurnStateMachine
         YouTurnWorkingState turn,
         YouTurnEffects effects)
     {
+        bool? keepPositive = _lastStep != 0 && _lastStepTrack == track.Name ? _lastStep > 0 : null;
         var (nextLineInside, positiveDirection) = _pathing.WouldNextLineBeInsideBoundary(
-            track, abHeading, guidance, ctx.Boundary, ctx.HeadlandLine, ctx.UTurnSkipRows);
+            track, abHeading, guidance, ctx.Boundary, ctx.HeadlandLine, ctx.UTurnSkipRows, keepPositive);
 
         _logger.LogDebug("[YouTurn] Creating turn? nextLineInside={Inside} positiveDir={Dir}", nextLineInside, positiveDirection);
         if (!nextLineInside)
@@ -1053,6 +1064,7 @@ public sealed class YouTurnStateMachine
         }
 
         var config = _configStore;
+        int passBefore = guidance.HowManyPathsAway;
 
         if (turn.ReturnPassTargetPath.HasValue)
         {
@@ -1094,6 +1106,9 @@ public sealed class YouTurnStateMachine
             _logger.LogDebug("[YouTurn] Turn complete! Normal: offset {Sign} by {Change}",
                 positiveOffset ? "positive" : "negative", offsetChange);
         }
+
+        _lastStep = Math.Sign(guidance.HowManyPathsAway - passBefore);
+        _lastStepTrack = ctx.SelectedTrack?.Name;
 
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         _logger.LogDebug("[YouTurn] Now on path {Path} ({Off:F1}m from reference)",
@@ -1160,7 +1175,7 @@ public sealed class YouTurnStateMachine
         return minDistance;
     }
 
-    private static TractorZone DetermineZone(
+    private TractorZone DetermineZone(
         double easting,
         double northing,
         Boundary? boundary,
@@ -1169,7 +1184,7 @@ public sealed class YouTurnStateMachine
         // Cultivated area (inside the headland) — most common case, check first.
         if (headlandLine != null && headlandLine.Count >= 3)
         {
-            if (GeometryMath.IsPointInPolygon(headlandLine, new Vec2(easting, northing)))
+            if (_headlandIndex.Contains(headlandLine, easting, northing))
                 return TractorZone.InCultivatedArea;
         }
 

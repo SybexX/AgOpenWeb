@@ -10,6 +10,7 @@ using AgOpenWeb.Services.Battery;
 using AgOpenWeb.Services.Interfaces;
 using AgOpenWeb.Services.YouTurn;
 using AgOpenWeb.ViewModels;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 
@@ -31,14 +32,17 @@ public class MainViewModelBuilder
     public IAutoSteerService AutoSteerService { get; } = Substitute.For<IAutoSteerService>();
     public IMapService MapService { get; } = Substitute.For<IMapService>();
     public ICoverageMapService CoverageMapService { get; } = Substitute.For<ICoverageMapService>();
-    public ISectionControlService SectionControlService { get; } = Substitute.For<ISectionControlService>();
+    public ISectionControlService SectionControlService { get; set; } = Substitute.For<ISectionControlService>();
+    public IBoundaryRecordingService BoundaryRecordingService { get; set; } = Substitute.For<IBoundaryRecordingService>();
     public IToolPositionService ToolPositionService { get; } = Substitute.For<IToolPositionService>();
     public IGpsSimulationService SimulatorService { get; } = Substitute.For<IGpsSimulationService>();
     public IGpsPipelineService GpsPipelineService { get; } = Substitute.For<IGpsPipelineService>();
     public IModuleCommunicationService ModuleCommunicationService { get; set; } = Substitute.For<IModuleCommunicationService>();
     public IConfigurationService ConfigurationService { get; set; } = Substitute.For<IConfigurationService>();
-    public IFieldService FieldService { get; } = Substitute.For<IFieldService>();
-    public AgOpenWeb.Services.Interfaces.ITramLineService TramLineService { get; } = Substitute.For<AgOpenWeb.Services.Interfaces.ITramLineService>();
+    public IFieldService FieldService { get; set; } = Substitute.For<IFieldService>();
+    public IJobService JobService { get; set; } = Substitute.For<IJobService>();
+    public ILogger<MainViewModel> Logger { get; set; } = NullLogger<MainViewModel>.Instance;
+    public AgOpenWeb.Services.Interfaces.ITramLineService TramLineService { get; set; } = Substitute.For<AgOpenWeb.Services.Interfaces.ITramLineService>();
     public AgOpenWeb.Services.Pipeline.PipelineIntents Intents { get; } = new();
     public AgOpenWeb.Services.Geometry.IPolygonOffsetService PolygonOffsetService { get; set; } = Substitute.For<AgOpenWeb.Services.Geometry.IPolygonOffsetService>();
 
@@ -67,7 +71,7 @@ public class MainViewModelBuilder
             simulatorService: SimulatorService,
             settingsService: SettingsService,
             mapService: MapService,
-            boundaryRecordingService: Substitute.For<IBoundaryRecordingService>(),
+            boundaryRecordingService: BoundaryRecordingService,
             boundaryBuilderService: Substitute.For<IBoundaryBuilderService>(),
             headlandBuilderService: Substitute.For<AgOpenWeb.Services.Headland.IHeadlandBuilderService>(),
             trackGuidanceService: TrackGuidanceService,
@@ -92,11 +96,11 @@ public class MainViewModelBuilder
             chartDataService: Substitute.For<IChartDataService>(),
             audioService: Substitute.For<IAudioService>(),
             elevationLogService: Substitute.For<IElevationLogService>(),
-            jobService: Substitute.For<IJobService>(),
+            jobService: JobService,
             tramLineService: TramLineService,
             gpsPipelineService: GpsPipelineService,
             intents: Intents,
-            logger: NullLogger<MainViewModel>.Instance,
+            logger: Logger,
             appState: new ApplicationState(),
             configStore: ConfigurationStore.Instance,
             persistentStateService: Substitute.For<IPersistentStateService>(),

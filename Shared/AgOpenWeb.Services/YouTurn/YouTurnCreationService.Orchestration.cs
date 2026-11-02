@@ -129,14 +129,14 @@ public partial class YouTurnCreationService
             {
                 var path = output.TurnPath;
 
-                // Smooth FIRST, then validate. The spiral/pretzel guard must judge the path
-                // that is actually driven, not raw construction artifacts: the curve generator
-                // can leave sub-metre folds at arc/leg seams that produce spurious 180° heading
-                // flips. Those inflate the cumulative-turn metric and false-reject a perfectly
-                // good curved U-turn (net 180°), dropping it to the straight fallback — the
-                // "south end misaligned" report. Smoothing removes the folds; a genuine spiral
-                // survives it.
-                TurnPathSmoothing.Smooth(path, config.Guidance.UTurnSmoothing);
+                // Smooth FIRST, then validate: the spiral/pretzel guard judges the path that is
+                // driven. The smoothing is AgOpenGPS's (SmoothYouTurn with 6 points, one pass, a
+                // U turn only): a wider or repeated average pulls a tight arc inward, so the turn
+                // ended a metre short of the turn line and bent tighter than the set radius at a
+                // 5 m radius. The legs meet the arc without a fold (WalkLegByDistance), so there
+                // is nothing for a heavier smoothing to hide.
+                if (input.TurnType != YouTurnType.KStyle)
+                    TurnPathSmoothing.SmoothYouTurn(path, 6);
 
                 // Measure turning from SEGMENT DIRECTIONS (positions), not the stored per-point
                 // headings — smoothing only moves positions (it preserves the stale headings),
@@ -169,8 +169,11 @@ public partial class YouTurnCreationService
                     }
                 }
 
-                // ~π expected for U-turn; tolerate ±30° slack to account for approach angle.
-                bool netIsUTurnLike = Math.Abs(Math.Abs(netHeadingChange) - Math.PI) < Math.PI / 6.0;
+                // ~π expected for a U-turn; tolerate ±30° slack to account for approach angle.
+                // A K-turn's path is AgOpenGPS's KStyleTurn: an arc of 2.2 rad and a straight tail,
+                // the rest of the turn made backing up, so its net turn is 2.2 rad (126°), not π.
+                double expectedNet = input.TurnType == YouTurnType.KStyle ? 2.2 : Math.PI;
+                bool netIsUTurnLike = Math.Abs(Math.Abs(netHeadingChange) - expectedNet) < Math.PI / 6.0;
                 bool cumulativeRunaway = totalHeadingChange > Math.PI * 4.0;
 
                 if (!netIsUTurnLike || cumulativeRunaway)
@@ -353,8 +356,10 @@ public partial class YouTurnCreationService
 
         double headlandWidthForTurn = Math.Max(totalHeadlandWidth - toolWidth, toolWidth);
 
+        // Asked for every candidate path point: the turn line's strip index, built once per plan.
+        var turnArea = PolygonSlabIndex.Build(turnBoundaryVec3);
         Func<Vec3, int> isPointInsideTurnArea = point =>
-            GeometryMath.IsPointInPolygon(turnBoundaryVec3, point) ? 0 : 1;
+            turnArea != null && turnArea.Contains(point.Easting, point.Northing) ? 0 : 1;
 
         var pivotPosition = new Vec3(currentPosition.Easting, currentPosition.Northing, headingRadians);
 
@@ -376,7 +381,8 @@ public partial class YouTurnCreationService
             : DensifyAbLine(track.Points);
 
         double widthMinusOverlap = toolWidth - config.Tool.Overlap;
-        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap, guidance.NudgeOffset);
+        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap, guidance.NudgeOffset,
+            Models.Track.PassGeometry.ToolShift(config.Tool.Offset, guidance.IsHeadingSameWay));
         List<Vec3> offsetCurve = Math.Abs(offsetDistance) < 0.01
             ? new List<Vec3>(basePoints)
             : CurveProcessing.CreateOffsetCurve(basePoints, offsetDistance);
@@ -493,7 +499,8 @@ public partial class YouTurnCreationService
 
         var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap);
+        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap, 0,
+            Models.Track.PassGeometry.ToolShift(config.Tool.Offset, guidance.IsHeadingSameWay));
 
         List<Vec3> searchPoints = Math.Abs(offsetDistance) < 0.01
             ? track.Points
@@ -553,7 +560,8 @@ public partial class YouTurnCreationService
 
         var config = _configStore;
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
-        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap);
+        double offsetDistance = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, widthMinusOverlap, 0,
+            Models.Track.PassGeometry.ToolShift(config.Tool.Offset, guidance.IsHeadingSameWay));
 
         Models.Track.Track currentOffsetTrack;
         if (Math.Abs(offsetDistance) < 0.01)
@@ -711,7 +719,8 @@ public partial class YouTurnCreationService
         if (track == null || track.Points.Count != 2) return pos;
         var a = track.Points[0];
         double width = _configStore.ActualToolWidth - _configStore.Tool.Overlap;
-        double passOffset = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, width, guidance.NudgeOffset);
+        double passOffset = Models.Track.PassGeometry.Offset(track, guidance.HowManyPathsAway, width, guidance.NudgeOffset,
+            Models.Track.PassGeometry.ToolShift(_configStore.Tool.Offset, guidance.IsHeadingSameWay));
         double rightE = Math.Cos(abHeading), rightN = -Math.Sin(abHeading);
         double perp = (pos.Easting - a.Easting) * rightE + (pos.Northing - a.Northing) * rightN;
         double shift = passOffset - perp;

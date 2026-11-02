@@ -69,6 +69,10 @@ public class CoverageMapService : ICoverageMapService
     // resolution.
     private const long MAX_DISPLAY_PIXELS = 25_000_000;
 
+    // Largest display grid side the web clients can hold as one texture (0 = no limit
+    // reported yet). See LimitDisplaySide.
+    private int _maxDisplaySide;
+
     // Per-zone cell counters for acreage calculation (zone index -> cell count)
     private readonly Dictionary<int, long> _cellCountPerZone = new();
 
@@ -191,7 +195,7 @@ public class CoverageMapService : ICoverageMapService
     private int _edgePointCount;
     private const double EDGE_GATE = 2.0;          // metres between committed edge vertex pairs
     private const int EDGE_MAX_POINTS = 200_000;   // safety cap on total accumulated points
-    private const double EDGE_STROKE_WIDTH = 0.6;  // metres; the stroke in app.js drawCoverageEdgeSk
+    private const double EDGE_STROKE_WIDTH = 0.6;  // metres; the stroke in js/map-layers.js drawCoverageEdgeSk
 
     private void ClearEdges()
     {
@@ -457,11 +461,14 @@ public class CoverageMapService : ICoverageMapService
             return;
         }
 
-        // Form quad: prevLeft -> prevRight -> currRight -> currLeft
-        var p0 = lastEdges.Left;
-        var p1 = lastEdges.Right;
-        var p2 = currRight;
-        var p3 = currLeft;
+        // The coverage margin (Tool settings) widens what is painted by a few centimetres each
+        // side so adjacent sections and successive quads leave no hairline gap in the cells. It
+        // is a painting margin only: the worked area and the vector edges are the section's own
+        // edges, as AgOpenGPS's patches are (checklist 4.11/4.12; counted into the area it
+        // inflated the worked area by the margin per section, 3 % on a 10 m tool in three).
+        double margin = _configStore.Tool.CoverageMarginMeters;
+        var (p0, p1) = Widen(lastEdges.Left, lastEdges.Right, margin);   // prevLeft, prevRight
+        var (p3, p2) = Widen(currLeft, currRight, margin);               // currLeft, currRight
 
         // Find bounding box
         double minE = Math.Min(Math.Min(p0.E, p1.E), Math.Min(p2.E, p3.E));
@@ -503,6 +510,18 @@ public class CoverageMapService : ICoverageMapService
     /// Check if a point is inside a quad (4-point polygon).
     /// Uses cross product sign test - point is inside if all cross products have same sign.
     /// </summary>
+    /// <summary>The edge pair moved apart by <paramref name="margin"/> along its own line.</summary>
+    private static ((double E, double N) left, (double E, double N) right) Widen(
+        (double E, double N) left, (double E, double N) right, double margin)
+    {
+        if (margin <= 0) return (left, right);
+        double dE = right.E - left.E, dN = right.N - left.N;
+        double len = Math.Sqrt(dE * dE + dN * dN);
+        if (len < 1e-9) return (left, right);
+        dE *= margin / len; dN *= margin / len;
+        return ((left.E - dE, left.N - dN), (right.E + dE, right.N + dN));
+    }
+
     private static bool IsPointInQuad(double px, double py,
         (double E, double N) p0, (double E, double N) p1,
         (double E, double N) p2, (double E, double N) p3)
@@ -1313,7 +1332,45 @@ public class CoverageMapService : ICoverageMapService
         double multiplier = _configStore.Display.DisplayResolutionMultiplier;
         if (multiplier > 1.0) cellSize *= multiplier;
 
+        // Keep each side within the largest texture a browser can hold. A bigger grid can't be
+        // a GPU render target, and the web client's 2D fallback then copies the whole image
+        // several times over (about 100 MB per copy at 5000 x 5000), enough to get a tablet
+        // killed. SetDisplayGrid snaps to the world grid, which can add a pixel at each end.
+        if (_maxDisplaySide > 2)
+        {
+            double needed = Math.Max(worldWidthM, worldHeightM) / (_maxDisplaySide - 2);
+            if (needed > cellSize) cellSize = SnapDisplayCellUp(needed);
+        }
+
         return cellSize;
+    }
+
+    /// <summary>The next display cell size at or above <paramref name="cellSize"/>, from a
+    /// short list of steps, so saved display tiles keep to a few predictable cell sizes.</summary>
+    private static double SnapDisplayCellUp(double cellSize)
+    {
+        foreach (double step in DisplayCellSteps)
+            if (cellSize <= step + 1e-9) return step;
+        return Math.Ceiling(cellSize);
+    }
+
+    private static readonly double[] DisplayCellSteps = { 0.15, 0.2, 0.25, 0.35, 0.5, 0.75 };
+
+    /// <summary>
+    /// Limit both sides of the display grid to <paramref name="maxSide"/> pixels (a web
+    /// client's largest texture). Only ever tightens: a second browser with a bigger GPU
+    /// doesn't lift the limit the tablet set. An open field is regridded at once.
+    /// </summary>
+    public void LimitDisplaySide(int maxSide)
+    {
+        if (maxSide <= 2) return;
+        lock (_coverageLock)
+        {
+            if (_maxDisplaySide != 0 && _maxDisplaySide <= maxSide) return;
+            _maxDisplaySide = maxSide;
+        }
+        Console.WriteLine($"[Coverage] Display grid limited to {maxSide} px a side (the web client's largest texture)");
+        RebuildDisplayForResolutionChange();
     }
 
     /// <summary>

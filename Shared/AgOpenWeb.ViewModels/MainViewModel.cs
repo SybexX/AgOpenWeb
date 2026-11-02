@@ -126,7 +126,6 @@ public partial class MainViewModel : ObservableObject
     }
 
     // Track-on-boundary detection: skip boundary disengage on first pass
-    private bool _isSelectedTrackOnBoundary;
 
     // Track guidance state is now in MainViewModel.Guidance.cs
     // YouTurn state is now in MainViewModel.YouTurn.cs
@@ -408,7 +407,9 @@ public partial class MainViewModel : ObservableObject
         _gpsService.GpsDataUpdated += OnGpsDataUpdated;
         _autoSteerService.StateUpdated += OnAutoSteerStateUpdated;
         _autoSteerService.GuidanceLost += OnGuidanceLost;
+        _autoSteerService.SensorKickout += OnSensorKickout;
         (_autoSteerService as Services.AutoSteer.AutoSteerService)?.SetTramLineService(_tramLineService);
+        (_autoSteerService as Services.AutoSteer.AutoSteerService)?.SetToolPositionService(_toolPositionService);
         (_autoSteerService as Services.AutoSteer.AutoSteerService)?.SetSmartWasService(_smartWasService);
         _autoSteerService.Start(); // Enable zero-copy GPS pipeline
 
@@ -465,7 +466,7 @@ public partial class MainViewModel : ObservableObject
         // Replaces Phase 2c #1's 10 Hz "display tick" — same architecture,
         // half the rate, and now also includes diagnostics like
         // GpsToPgnLatencyMs that AutoSteer was writing at 100 Hz.
-        // See Plans/perf_data/2026-05-20/ANALYSIS.md.
+        // See Plans/Ideas/perf_data/2026-05-20/ANALYSIS.md.
         _statusTickTimer = _timerFactory.Create();
         _statusTickTimer.Interval = TimeSpan.FromMilliseconds(200);
         _statusTickTimer.Tick += OnStatusTick;
@@ -473,6 +474,7 @@ public partial class MainViewModel : ObservableObject
         _udpService.ModuleConnectionChanged += OnModuleConnectionChanged;
         _ntripService.ConnectionStatusChanged += OnNtripConnectionChanged;
         _ntripService.RtcmDataReceived += OnRtcmDataReceived;
+        _ntripService.Notice += OnNtripNotice;
         ConfigStore.Connections.PropertyChanged += OnNtripEnabledChanged;
         _fieldService.ActiveFieldChanged += OnActiveFieldChanged;
         FieldFullyLoaded += OnFieldFullyLoaded;
@@ -481,6 +483,7 @@ public partial class MainViewModel : ObservableObject
         _boundaryRecordingService.StateChanged += OnBoundaryStateChanged;
         _moduleCommunicationService.AutoSteerToggleRequested += OnAutoSteerToggleRequested;
         _moduleCommunicationService.SectionMasterToggleRequested += OnSectionMasterToggleRequested;
+        _autoSteerService.RemoteSwitchesReceived += OnRemoteSwitchesReceived;
         _sectionControlService.SectionStateChanged += OnSectionStateChanged;
         _coverageMapService.BoundsExpanded += OnCoverageBoundsExpanded;
 
@@ -717,14 +720,8 @@ public partial class MainViewModel : ObservableObject
             toolN = hitchN - Math.Cos(toolHeading) * pivotOffset;
         }
 
-        // Lateral offset perpendicular to tool heading (right is positive,
-        // matching ToolPositionService.ApplyLateralOffset).
-        if (Math.Abs(tool.Offset) > 0.001)
-        {
-            double perp = toolHeading + Math.PI / 2.0;
-            toolE += Math.Sin(perp) * tool.Offset;
-            toolN += Math.Cos(perp) * tool.Offset;
-        }
+        // No lateral offset: the section spans the map draws from this point carry it,
+        // as in ToolPositionService (#446).
 
         _mapService.SetAllPositions(
             p.Position.Easting, p.Position.Northing, p.Heading,
@@ -1288,7 +1285,7 @@ public partial class MainViewModel : ObservableObject
 
     private void OnAutoSteerToggleRequested(object? sender, AutoSteerToggleEventArgs e)
     {
-        _dispatcher.Post(() =>
+        void Toggle()
         {
             // The module arming for a steer-wizard Free Drive test isn't a request to steer:
             // ignore it quietly (ToggleAutoSteerCommand would refuse it anyway, #154).
@@ -1297,8 +1294,22 @@ public partial class MainViewModel : ObservableObject
 
             // Toggle autosteer when requested by module communication service
             // (e.g., from work switch or steer switch)
-            ToggleAutoSteerCommand?.Execute(null);
-        });
+            ToggleAutoSteerCommand?.Execute(IsAutoSteerEngaged
+                ? ModuleStoppedSteeringReason()
+                : "steer switch or button on the steer module");
+        }
+
+        // UpdateModuleSwitches runs on the host loop, so toggle right away and report the
+        // result: the steer switch → sections check that follows needs it.
+        if (_dispatcher.CheckAccess())
+        {
+            Toggle();
+            e.IsAutoSteerOnAfter = IsAutoSteerEngaged;
+        }
+        else
+        {
+            _dispatcher.Post(Toggle);
+        }
     }
 
     private void OnSectionMasterToggleRequested(object? sender, SectionMasterToggleEventArgs e)
@@ -1372,6 +1383,11 @@ public partial class MainViewModel : ObservableObject
         {
             _moduleSteeredSinceEngage = false;
             _audioService.Play(Services.Interfaces.SoundEffect.AutoSteerOff);
+            // With a Switch or Button set, UpdateModuleSwitches turns AutoSteer off next and
+            // logs why; with None it stays on, so say so here.
+            if (ConfigStore.AutoSteer.ExternalEnable == 0)
+                _logger.LogInformation("[AutoSteer] {Reason}; AutoSteer stays on (steer switch / button: None)",
+                    ModuleStoppedSteeringReason());
             ReportFailure("Steer module stopped steering (kickout, switch or button)");
         }
     }
@@ -1655,8 +1671,18 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// Opens a field from the specified path. This is the single entry point for all field opening.
     /// Handles: closing previous field, loading boundary, background, coverage, tracks, headland.
+    /// Leaving a field worked with no job asks first, as Close Field does: opening another field
+    /// (from the list, Drive In, New, From Existing, KML, ISO-XML) used to drop that coverage
+    /// without a word (checklist 7.9). The open runs from the prompt's Save or Discard.
     /// </summary>
     public async Task OpenFieldAsync(string fieldPath, string fieldName)
+    {
+        if (TryShowUnsavedCoverageGuard(() => _ = OpenFieldCoreAsync(fieldPath, fieldName)))
+            return;
+        await OpenFieldCoreAsync(fieldPath, fieldName);
+    }
+
+    private async Task OpenFieldCoreAsync(string fieldPath, string fieldName)
     {
         _logger.LogDebug($"[Field] OpenFieldAsync: {fieldName} at {fieldPath}");
 
@@ -1755,7 +1781,7 @@ public partial class MainViewModel : ObservableObject
                 // Migrate legacy/imported dense boundaries to normalized resolution
                 // in-memory so derived geometry (tram/headland), inside-tests, and
                 // rendering operate on a sane point count. Persisted on the next
-                // explicit boundary save. See Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+                // explicit boundary save. See Plans/Completed/BOUNDARY_RESOLUTION_NORMALIZATION.md.
                 NormalizeBoundaryInPlace(boundary);
                 SetCurrentBoundary(boundary);
                 CenterMapOnBoundary(boundary);
@@ -1870,12 +1896,11 @@ public partial class MainViewModel : ObservableObject
             // to start unconditionally here.
             StartCoverageAutosave();
 
-            // Tram lines are computed on demand (when the user presses Build/Toggle
-            // tram), not eagerly on field open: they are rarely used, and parsing a
-            // large saved file was costing seconds on the open critical path, so they
-            // aren't saved at all. The tram buttons regenerate via UpdateTramLines from
-            // the current track/systems. Start clean so a prior field's lines don't linger. See
-            // Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+            // Tram lines aren't saved (parsing a large saved file was costing seconds on the
+            // open critical path, see Plans/Completed/BOUNDARY_RESOLUTION_NORMALIZATION.md):
+            // they are regenerated from the tram systems and the track, below, once those are
+            // loaded. Start clean so a prior field's lines don't linger (the track restore above
+            // built lines with the previous field's systems).
             _tramLineService.Clear();
             _mapService.SetTramLines(
                 _tramLineService.OuterBoundaryTrack,
@@ -1900,6 +1925,12 @@ public partial class MainViewModel : ObservableObject
             {
                 _logger.LogWarning(ex, "Failed to load tram systems");
             }
+
+            // The trams come back with the field, as AgOpenGPS reads its Tram.txt back on open
+            // (checklist 6.10): the same lines, regenerated from the systems and the restored
+            // track. Nothing is built for a field that had neither.
+            if (ConfigStore.Tram.Systems.Count > 0 || SelectedTrack != null)
+                UpdateTramLines(SelectedTrack);
 
             // Handle NTRIP profile
             _ = HandleNtripProfileForFieldAsync(fieldName);
@@ -1937,6 +1968,57 @@ public partial class MainViewModel : ObservableObject
             State.UI.IsBusy = false;
             _logger.LogDebug("[Busy] OpenFieldAsync: Complete");
         }
+    }
+
+    /// <summary>The field's own files, as a close writes them: tram systems and settings, the
+    /// elevation log, the tracks and field.geojson. Coverage is the caller's (it needs the job).</summary>
+    private void SaveFieldFiles(Field field)
+    {
+        if (ConfigStore.Tram.Systems.Count > 0)
+        {
+            Services.Tram.TramSystemFileService.Save(field.DirectoryPath, ConfigStore.Tram.Systems);
+            _logger.LogDebug($"[Tram] Saved {ConfigStore.Tram.Systems.Count} tram systems");
+        }
+        Services.Tram.TramConfigFileService.Save(field.DirectoryPath, ConfigStore.Tram);
+        _elevationLogService.Flush(field.DirectoryPath);
+        SaveTracksToFile();
+        _fieldService.SaveField(field);
+    }
+
+    /// <summary>
+    /// Save the open field as a close would, without closing it: when the app stops or goes to
+    /// the background. The active job's coverage goes to its job folder. Coverage painted with
+    /// no job goes to a new job: nobody is there to answer the unsaved-coverage question, and
+    /// dropping it loses the work. Callable from any thread: it runs on the host loop and waits
+    /// up to <paramref name="timeout"/>. Returns false if it didn't finish in time or failed.
+    /// </summary>
+    public bool SaveOpenFieldForExit(TimeSpan timeout)
+    {
+        try
+        {
+            if (_dispatcher.CheckAccess()) { SaveOpenFieldNow(); return true; }
+            return _dispatcher.InvokeAsync(SaveOpenFieldNow).Wait(timeout);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[Field] Saving the open field at exit failed");
+            return false;
+        }
+    }
+
+    private void SaveOpenFieldNow()
+    {
+        var field = ActiveField;
+        if (field == null || string.IsNullOrEmpty(field.DirectoryPath)) return;
+        if (_jobService.ActiveJob == null && _coverageMapService.PatchCount > 0)
+        {
+            var job = _jobService.CreateJob(field.Name, workType: string.Empty, notes: string.Empty);
+            _logger.LogInformation("[Field] Exit: saved coverage worked with no job to a new job '{TaskName}'", job.TaskName);
+        }
+        if (_jobService.ActiveJob is { } active)
+            _coverageMapService.SaveToFile(field.DirectoryPath, active.TaskName);
+        SaveFieldFiles(field);
+        _logger.LogDebug("[Field] Saved '{FieldName}' at exit", field.Name);
     }
 
     /// <summary>
@@ -1987,25 +2069,8 @@ public partial class MainViewModel : ObservableObject
                 _logger.LogDebug("[Coverage] No active job; skipping coverage save (field-only open)");
             }
 
-            // Save tram systems
-            if (ConfigStore.Tram.Systems.Count > 0)
-            {
-                Services.Tram.TramSystemFileService.Save(ActiveField.DirectoryPath, ConfigStore.Tram.Systems);
-                _logger.LogDebug($"[Tram] Saved {ConfigStore.Tram.Systems.Count} tram systems");
-            }
-
-            // Save field-scoped tram scalar settings.
-            Services.Tram.TramConfigFileService.Save(ActiveField.DirectoryPath, ConfigStore.Tram);
-
-            // Flush elevation log
-            _elevationLogService.Flush(ActiveField.DirectoryPath);
+            SaveFieldFiles(ActiveField);
             _elevationLogService.Clear();
-
-            // Save tracks
-            SaveTracksToFile();
-
-            // Save field (writes geojson + legacy formats)
-            _fieldService.SaveField(ActiveField);
 
             // Suspend rather than close. M2 has no explicit "Close Job"
             // operator action — closing a field should leave the job
@@ -2045,6 +2110,7 @@ public partial class MainViewModel : ObservableObject
             IsAutoSteerEngaged = false;
             _autoSteerService.Disengage();
             SyncGuidanceStateToPipeline();
+            LogAutoSteerOff("field closed");
         }
 
         // CurrentFieldName clears via the pass-through when SetActiveField(null)
@@ -2252,7 +2318,7 @@ public partial class MainViewModel : ObservableObject
     // Curve recording state (drive mode)
     private List<Vec3> _recordedCurvePoints = new();
     private Vec3? _lastCurvePoint;
-    private const double CurveMinPointSpacing = 2.0; // Minimum 2m spacing between curve points
+    private const double CurveMinPointSpacing = 1.0; // a point a metre while driving a curve (AgOpenGPS: every fix)
 
     /// <summary>
     /// Whether curve recording is currently active
@@ -2346,6 +2412,7 @@ public partial class MainViewModel : ObservableObject
                 // Sync IsActive state with selection
                 if (oldValue != null)
                 {
+                    DiscardPendingRefNudge(oldValue); // an unsaved Ref Nudge move doesn't follow to the next line (#489)
                     oldValue.IsActive = false;
                 }
                 if (value != null)
@@ -2355,8 +2422,9 @@ public partial class MainViewModel : ObservableObject
                     // Show the track on the map when activated
                     _mapService.SetActiveTrack(value);
 
-                    // Generate tram lines from the selected track
-                    UpdateTramLines(value);
+                    // Generate tram lines from the selected track. A field open restores the
+                    // track before its tram systems are loaded and builds the lines once after.
+                    if (!_restoringTrack) UpdateTramLines(value);
 
                     // Phase D D6: compute the initial pass number + nudge offset
                     // locally from the track's persisted NudgeDistance (inverse of
@@ -2377,13 +2445,6 @@ public partial class MainViewModel : ObservableObject
                         _pendingInitialPathsAway = 0;
                         _pendingInitialNudgeOffset = 0;
                         _logger.LogDebug("[NUDGE] SelectedTrack setter: '{TrackName}' widthMinusOverlap too small, pathsAway=0", value.Name);
-                    }
-
-                    // Check if track runs along boundary (skip disengage on first pass)
-                    _isSelectedTrackOnBoundary = IsTrackOnBoundary(value);
-                    if (_isSelectedTrackOnBoundary)
-                    {
-                        _logger.LogDebug($"[SelectedTrack] Track '{value.Name}' is ON boundary - will skip boundary check on pass 0");
                     }
 
                     // For curved tracks, calculate and display max inward passes
@@ -2412,7 +2473,6 @@ public partial class MainViewModel : ObservableObject
                     // (the web's magenta offset line) — its cache is left alone so that change is seen.
                     _lastMirroredBaseTrack = null;
                     _mapService.SetGuidancePoints(0, 0, false);
-                    _isSelectedTrackOnBoundary = false;
                     // Clear any U-turn state associated with the deactivated track
                     ClearYouTurnState();
                 }
@@ -2508,12 +2568,22 @@ public partial class MainViewModel : ObservableObject
                 _tramSystemLineRanges[sys.Name] = (startIdx, lines.Count, false);
             }
         }
+        else if (!_hasTramSystemsEverUsed && track is { IsABLine: true })
+        {
+            // An AB line: tram lines parallel to it, clipped to the fence, plus the
+            // boundary tram track, as AgOpenGPS's CABLine.BuildTram. A straight line's
+            // offsets can't fold, so this doesn't bring back the curved-field "web".
+            _tramLineService.GenerateParallelTramLines(track, fieldWidth);
+            if (State.Field.CurrentBoundary?.OuterBoundary?.Points is { Count: >= 3 } fence)
+                _tramLineService.GenerateBoundaryTramTracks(
+                    fence.Select(p => new Models.Base.Vec3(p.Easting, p.Northing, p.Heading)).ToList());
+        }
         else if (!_hasTramSystemsEverUsed)
         {
-            // Controlled-traffic lanes parallel to the field boundary, spaced at the
-            // tram (sprayer/CTF) width. Clean concentric Clipper offsets — replaces the
-            // legacy per-point lateral offset of the guidance curve, which folded into a
-            // self-intersecting "web" on irregular/curved fields.
+            // A curve, or no track: controlled-traffic lanes parallel to the field boundary,
+            // spaced at the tram (sprayer/CTF) width. Clean concentric Clipper offsets —
+            // replaces the legacy per-point lateral offset of the guidance curve, which
+            // folded into a self-intersecting "web" on irregular/curved fields.
             _tramLineService.GenerateConcentricTramLanes();
         }
 
@@ -4217,6 +4287,7 @@ public partial class MainViewModel : ObservableObject
 
     // AB Line Guidance Commands - Bottom Bar (always visible)
     public ICommand? SnapLeftCommand { get; private set; }
+    public ICommand? StartPivotRecordingCommand { get; private set; }
     public ICommand? SnapRightCommand { get; private set; }
     public ICommand? StopGuidanceCommand { get; private set; }
     public ICommand? UTurnCommand { get; private set; }
@@ -4658,7 +4729,7 @@ public partial class MainViewModel : ObservableObject
     /// GPS-captured or imported boundaries (e.g. ~3431 points at ~1 m for a 440-acre
     /// field) otherwise propagate that density into tram/headland generation,
     /// inside-tests, and rendering. Idempotent: an already-sparse boundary is left
-    /// essentially unchanged. See Plans/BOUNDARY_RESOLUTION_NORMALIZATION.md.
+    /// essentially unchanged. See Plans/Completed/BOUNDARY_RESOLUTION_NORMALIZATION.md.
     /// </summary>
     private void NormalizeBoundaryInPlace(Boundary boundary)
     {
@@ -4976,6 +5047,16 @@ public partial class MainViewModel : ObservableObject
                             }
                         }
 
+                        // A KML ring repeats its first point at the end; a boundary doesn't (AgOpenGPS
+                        // FixFenceLine drops points that close together), so drop it here.
+                        if (polygonPoints.Count >= 4 && polygonPoints[0] == polygonPoints[^1])
+                        {
+                            sumLat -= polygonPoints[^1].Latitude;
+                            sumLon -= polygonPoints[^1].Longitude;
+                            totalValidPoints--;
+                            polygonPoints.RemoveAt(polygonPoints.Count - 1);
+                        }
+
                         if (polygonPoints.Count >= 3)
                         {
                             _kmlParsedPolygons.Add(polygonPoints);
@@ -5130,37 +5211,27 @@ public partial class MainViewModel : ObservableObject
     private void PopulateAvailableIsoXmlFiles()
     {
         AvailableIsoXmlFiles.Clear();
-
         // Import folder lives under the shared AgOpenWeb data root (honors
         // AGOPENWEB_DATA on the headless appliance), same as Fields/Tools/Vehicles —
         // NOT MyDocuments, which diverges from the data root on headless installs and
         // left the KML/ISO import list empty even when files were present.
         var importDir = Path.Combine(AppDataRoot.Documents, "Import");
-
         if (!Directory.Exists(importDir))
         {
             Directory.CreateDirectory(importDir);
             return;
         }
-
-        // Search for directories containing a TASKDATA file. Match the name
-        // case-insensitively: the ISO 11783 convention and our own exporter write
-        // "TASKDATA.XML" (uppercase), which a case-sensitive FS (Linux) would otherwise miss.
-        foreach (var dir in Directory.GetDirectories(importDir))
+        // One entry per partfield of every TASKDATA.XML (the web picker shows the same list).
+        foreach (var e in Services.IsoXml.IsoXmlImportCatalog.Scan(importDir))
         {
-            var taskDataFile = Directory.EnumerateFiles(dir)
-                .FirstOrDefault(f => string.Equals(Path.GetFileName(f), "TASKDATA.XML", StringComparison.OrdinalIgnoreCase));
-            if (taskDataFile != null)
+            AvailableIsoXmlFiles.Add(new IsoXmlFileItem
             {
-                var dirInfo = new DirectoryInfo(dir);
-                AvailableIsoXmlFiles.Add(new IsoXmlFileItem
-                {
-                    Name = dirInfo.Name,
-                    FullPath = dir,
-                    ModifiedDate = dirInfo.LastWriteTime,
-                    IsTaskData = true
-                });
-            }
+                Name = e.Name,
+                FullPath = e.Folder,
+                FieldIndex = e.FieldIndex,
+                ModifiedDate = new DirectoryInfo(e.Folder).LastWriteTime,
+                IsTaskData = true
+            });
         }
     }
 
@@ -6164,7 +6235,7 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            Services.GeoJson.GeoJsonFieldService.SaveTracks(activeField.DirectoryPath, SavedTracks.ToList());
+            Services.GeoJson.GeoJsonFieldService.SaveTracks(activeField.DirectoryPath, TracksForSave());
             _logger.LogDebug("[NUDGE] SaveTracksToFile: Saved {TrackCount} tracks", SavedTracks.Count);
         }
         catch (System.Exception ex)
@@ -6249,9 +6320,22 @@ public partial class MainViewModel : ObservableObject
 
             foreach (var track in tracks)
             {
+                // A recorded path saved more than once (each open added a copy, fixed above) is
+                // loaded once; the next save drops the copies.
+                if (track.IsRecordedPath && SavedTracks.Any(t => t.IsRecordedPath && SamePoints(t, track)))
+                    continue;
+
                 // Ensure all tracks start inactive (SelectedTrack setter will activate)
                 track.IsActive = false;
                 MigrateCurveTrack(track);
+                // A pivot imported from AgOpenGPS has only its centre: its reference circle is a
+                // pass width out, so its passes are AgOpenGPS's (half a width, then whole widths).
+                if (track.IsPivot && track.Points.Count < 3 && track.Points.Count > 0)
+                {
+                    var c = track.Points[0];
+                    track.Points = Models.Guidance.CurveProcessing.Circle(new Vec3(c.Easting, c.Northing, 0), PassWidth);
+                    track.IsClosed = true;
+                }
                 SavedTracks.Add(track); // mirrors into State.Field.Tracks
 
                 // Debug: log track details
@@ -6273,6 +6357,10 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
+    private static bool SamePoints(Track a, Track b) =>
+        a.Points.Count == b.Points.Count
+        && a.Points.Zip(b.Points).All(p => Math.Abs(p.First.Easting - p.Second.Easting) < 0.01 && Math.Abs(p.First.Northing - p.Second.Northing) < 0.01);
+
     private void LoadRecPathFromField(string fieldPath)
     {
         try
@@ -6281,6 +6369,10 @@ public partial class MainViewModel : ObservableObject
             var recPath = recPoints is { Count: >= 2 }
                 ? Track.FromRecordedPath("Recorded Path", recPoints.Select(p => new Vec3(p.Easting, p.Northing, p.Heading)).ToList())
                 : null;
+            // The path in use is usually among the field's tracks already (saved with them when it
+            // was recorded): adding it again put one more copy in the track list at every open.
+            if (recPath != null && SavedTracks.Any(t => t.IsRecordedPath && SamePoints(t, recPath)))
+                recPath = null;
             if (recPath != null)
             {
                 SavedTracks.Add(recPath);
@@ -6348,6 +6440,8 @@ public class IsoXmlFileItem
 {
     public string Name { get; set; } = string.Empty;
     public string FullPath { get; set; } = string.Empty;
+    /// <summary>Which partfield (PFD) of the TASKDATA.XML, in file order.</summary>
+    public int FieldIndex { get; set; }
     public DateTime ModifiedDate { get; set; }
     public bool IsTaskData { get; set; }
 }

@@ -103,6 +103,8 @@ public partial class MainViewModel
         State.Operation.ContourRef = result.ContourRef;
         if (result.HasContoursToSave) SaveContoursToField();
 
+        State.Field.IsOutOfBounds = result.IsOutOfBounds;
+
         // Hydraulic lift sounds on each up/down change (AgOpenGPS CHead.SetHydPosition;
         // gated by the Hydraulic sound setting in the audio service, #110).
         if (result.HydLiftState != _lastHydLiftState)
@@ -118,7 +120,10 @@ public partial class MainViewModel
             IsAutoSteerEngaged = false;
             _autoSteerService.Disengage();
             _audioService.Play(Services.Interfaces.SoundEffect.AutoSteerOff);
-            StatusMessage = result.DisengageReason ?? "AutoSteer disengaged";
+            // The cycle's own kickouts (boundary, speed limits, RTK lost): only the app knows
+            // why, so say it on screen. The steer module only sees PGN 254 stop.
+            ReportFailure(result.DisengageReason ?? "AutoSteer disengaged");
+            LogAutoSteerOff(StatusMessage);
         }
 
         // Phase C C5: YouTurn + Guidance snapshot mirror. The cycle worker
@@ -250,6 +255,10 @@ public partial class MainViewModel
                 // consumers (remote/web map) can draw it (§ guidance projection).
                 State.Guidance.DisplayLine = g.DisplayTrack?.Points;
             }
+            if (!ReferenceEquals(State.Guidance.GuideLines, g.GuideLines))
+                State.Guidance.GuideLines = g.GuideLines;
+            if (!ReferenceEquals(State.Guidance.ToolPass, g.ToolPass))
+                State.Guidance.ToolPass = g.ToolPass;
             if (!ReferenceEquals(_lastMirroredBaseTrack, g.BaseTrack))
             {
                 _lastMirroredBaseTrack = g.BaseTrack;

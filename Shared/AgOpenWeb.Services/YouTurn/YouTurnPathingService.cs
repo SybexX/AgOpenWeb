@@ -34,6 +34,7 @@ public sealed class YouTurnPathingService
 {
     private readonly ILogger<YouTurnPathingService> _logger;
     private readonly ConfigurationStore _configStore;
+    private readonly PolygonIndexCache _headlandIndex = new(); // the cultivated-area test of every offset point
 
     public YouTurnPathingService(ILogger<YouTurnPathingService> logger, ConfigurationStore configStore)
     {
@@ -80,10 +81,14 @@ public sealed class YouTurnPathingService
         double widthMinusOverlap = config.ActualToolWidth - config.Tool.Overlap;
         // Include the nudge so the cyan next-track line matches the U-turn exit leg and the
         // line the tractor steers after completion exactly (all use PassGeometry.Offset).
-        double nextDistAway = PassGeometry.Offset(referenceTrack, nextPathsAway, widthMinusOverlap, guidance.NudgeOffset);
+        // The next pass is driven the other way, so its tool shift has the other sign (#446).
+        double toolShift = PassGeometry.ToolShift(config.Tool.Offset, guidance.IsHeadingSameWay);
+        double nextDistAway = PassGeometry.Offset(referenceTrack, nextPathsAway, widthMinusOverlap, guidance.NudgeOffset, -toolShift);
+        double currentDistAway = PassGeometry.Offset(referenceTrack, guidance.HowManyPathsAway, widthMinusOverlap, guidance.NudgeOffset, toolShift);
 
-        // Authoritative perpendicular width for the U-turn arc — direction lives in IsTurnLeft.
-        turn.NextTrackTurnOffset = Math.Abs(pathsToMove * widthMinusOverlap);
+        // Authoritative perpendicular width for the U-turn arc — direction lives in IsTurnLeft:
+        // from the line steered now to the next, the passes apart ± twice the tool offset.
+        turn.NextTrackTurnOffset = Math.Abs(nextDistAway - currentDistAway);
 
         Models.Track.Track nextTrack;
         if (referenceTrack.Points.Count == 2)
@@ -135,7 +140,8 @@ public sealed class YouTurnPathingService
     /// <summary>
     /// Check if the next pass line (in either direction) falls inside the cultivated area.
     /// Returns (isInside, positiveDirection) where positiveDirection indicates which
-    /// offset direction has cultivated area.
+    /// offset direction has cultivated area. With both sides inside, <paramref name="keepPositive"/>
+    /// (the way the last turn stepped) wins; without it, the side away from the reference line.
     /// </summary>
     public (bool isInside, bool positiveDirection) WouldNextLineBeInsideBoundary(
         Models.Track.Track currentTrack,
@@ -143,7 +149,8 @@ public sealed class YouTurnPathingService
         GuidanceWorkingState guidance,
         Boundary? boundary,
         IReadOnlyList<Vec3>? headlandLine,
-        int uTurnSkipRows)
+        int uTurnSkipRows,
+        bool? keepPositive = null)
     {
         if (boundary?.OuterBoundary == null || !boundary.OuterBoundary.IsValid)
             return (true, false);
@@ -162,11 +169,11 @@ public sealed class YouTurnPathingService
 
         if (negInside && posInside)
         {
-            // Both directions work — prefer the one that continues advancing
-            // (same direction as the current pass offset from 0).
-            // If on pass 0, prefer negative (original convention).
-            bool preferPositive = guidance.HowManyPathsAway > 0;
-            return (true, preferPositive);
+            // Both directions work: keep stepping the way the last turn went. The pass number's
+            // sign says nothing about which side is worked: started from the field's edge on the
+            // negative side, "away from 0" sent every turn back over worked passes (#523). Before
+            // the first turn, away from the reference line (on pass 0, negative).
+            return (true, keepPositive ?? guidance.HowManyPathsAway > 0);
         }
         if (negInside) return (true, false);
         if (posInside) return (true, true);
@@ -411,12 +418,14 @@ public sealed class YouTurnPathingService
                 }
                 if (coarse.Count >= 3) area = coarse;
             }
+            // Every point of the offset curve is tested: the area's strip index, built once here.
+            var areaIndex = area != null ? PolygonSlabIndex.Build(area) : null;
 
             foreach (var p in CurveProcessing.CreateOffsetCurve(reference, distAway))
             {
                 if (area != null
                     && (p.Easting < minE || p.Easting > maxE || p.Northing < minN || p.Northing > maxN
-                        || !GeometryMath.IsPointInPolygon(area, new Vec2(p.Easting, p.Northing))))
+                        || !(areaIndex?.Contains(p.Easting, p.Northing) ?? false)))
                     continue;
                 inside++;
                 if (isPointCovered(p.Easting, p.Northing)) covered++;
@@ -503,13 +512,13 @@ public sealed class YouTurnPathingService
     }
 
     // Headland line takes precedence; fall back to the outer boundary when no headland is defined.
-    private static bool IsPointInsideCultivatedArea(
+    private bool IsPointInsideCultivatedArea(
         double easting, double northing,
         Boundary? boundary,
         IReadOnlyList<Vec3>? headlandLine)
     {
         if (headlandLine != null && headlandLine.Count >= 3)
-            return GeometryMath.IsPointInPolygon(headlandLine, new Vec2(easting, northing));
+            return _headlandIndex.Contains(headlandLine, easting, northing);
 
         if (boundary?.OuterBoundary != null && boundary.OuterBoundary.IsValid)
             return boundary.OuterBoundary.IsPointInside(easting, northing);
