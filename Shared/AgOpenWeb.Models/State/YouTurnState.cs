@@ -216,6 +216,18 @@ public class YouTurnState : ObservableObject
     /// </summary>
     public bool? NextUTurnDirectionLeftOverride { get; set; }
 
+    /// <summary>
+    /// The side picked with the U-turn arrow, held until a turn starts.
+    /// Mirror of <see cref="Pipeline.YouTurnWorkingState.HeldDirectionLeft"/>.
+    /// </summary>
+    public bool? HeldDirectionLeft { get; set; }
+
+    /// <summary>
+    /// The pass the turn was built to land on.
+    /// Mirror of <see cref="Pipeline.YouTurnWorkingState.PlannedNextPath"/>.
+    /// </summary>
+    public int? PlannedNextPath { get; set; }
+
     public void Reset()
     {
         IsTriggered = false;
@@ -236,6 +248,8 @@ public class YouTurnState : ObservableObject
         AltSign = 0;
         CurrentZone = TractorZone.OutsideBoundary;
         NextUTurnDirectionLeftOverride = null;
+        HeldDirectionLeft = null;
+        PlannedNextPath = null;
     }
 
     public void CompleteTurn()
@@ -245,6 +259,8 @@ public class YouTurnState : ObservableObject
         TurnPath = null;
         ArcStart = null;
         LastTurnWasLeft = IsTurnLeft;
+        HeldDirectionLeft = null;
+        PlannedNextPath = null;
         HasCompletedFirstTurn = true;
         YouTurnCounter = 0;
     }

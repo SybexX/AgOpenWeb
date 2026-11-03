@@ -79,6 +79,107 @@ public class DirectionSwapTests
         });
     }
 
+    // ── Normal: the side holds while the turn is planned again (#577) ─────
+
+    [TestCase(1)]
+    [TestCase(3)]
+    public void Normal_Swap_HoldsWhenTheSkipChanges(int newSkip)
+    {
+        var bench = new Bench(skipRows: 0);
+        var (guidance, turn) = bench.OnPass(-1);
+
+        bench.Tick(guidance, turn);
+        Assert.That(turn.IsTurnLeft, Is.True, "the scenario: the planner turns left");
+        turn.NextUTurnDirectionLeftOverride = false;
+        bench.Tick(guidance, turn);
+        Assert.That(turn.IsTurnLeft, Is.False, "swapped to the right");
+
+        // The skip buttons: the pipeline drops the planned turn and the next tick plans again.
+        bench.SkipRows = newSkip;
+        YouTurnStateMachine.DiscardPlannedTurn(turn);
+        bench.Tick(guidance, turn);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(turn.IsTurnLeft, Is.False, "still to the right, as the operator set it");
+            Assert.That(turn.NextTrack!.Points[0].Easting, Is.EqualTo(PassX(-1 + newSkip + 1)).Within(0.01));
+        });
+    }
+
+    // #585: the skip (and the skip mode) changed while the turn was being driven. The turn was
+    // built to land on one pass; completing it must put guidance on that pass, not on the pass
+    // the new skip would have chosen from where the turn started.
+    [TestCase(false)]
+    [TestCase(true)]
+    public void Normal_SkipChangedDuringTheTurn_LandsOnThePassTheTurnWasBuiltFor(bool alternateToo)
+    {
+        var bench = new Bench(skipRows: 3);
+        var (guidance, turn) = bench.OnPass(-1);
+        bench.Tick(guidance, turn);
+        double plannedX = turn.NextTrack!.Points[0].Easting;
+        int planned = (int)Math.Round((plannedX - Width / 2) / Width); // PassX inverted
+        Assert.That(Math.Abs(planned - -1), Is.EqualTo(4), "the scenario: skip 3 moves four passes");
+
+        turn.IsTriggered = turn.IsExecuting = true; // driving the turn
+        bench.SkipRows = 0;
+        bench.Alternate = alternateToo;
+        bench.Complete(guidance, turn);
+
+        Assert.That(guidance.HowManyPathsAway, Is.EqualTo(planned),
+            "on the pass the turn reached, not one picked with the new skip");
+    }
+
+    [Test]
+    public void Normal_SkipChangedDuringTheTurn_AppliesFromTheNextTurn()
+    {
+        var bench = new Bench(skipRows: 3);
+        var (guidance, turn) = bench.OnPass(-1);
+        bench.Tick(guidance, turn);
+        turn.IsTriggered = turn.IsExecuting = true;
+        bench.SkipRows = 0;
+        bench.Complete(guidance, turn);
+        int landed = guidance.HowManyPathsAway;
+
+        int next = bench.TurnAndComplete(guidance, turn);
+        Assert.That(Math.Abs(next - landed), Is.EqualTo(1), "the next turn moves by the new skip");
+    }
+
+    [Test]
+    public void Normal_Swap_IsForTheOneTurn()
+    {
+        var bench = new Bench(skipRows: 0);
+        var (guidance, turn) = bench.OnPass(-3);
+
+        Assert.That(bench.TurnAndComplete(guidance, turn, swap: true), Is.EqualTo(-2), "the scenario: swapped east");
+        Assert.That(turn.HeldDirectionLeft, Is.Null, "the side was for that turn");
+        YouTurnStateMachine.DiscardPlannedTurn(turn);
+        Assert.That(turn.NextUTurnDirectionLeftOverride, Is.Null, "a later plan is not swapped");
+    }
+
+    // ── Normal: no pass to turn onto (#570, Graeme's later dump) ─────────
+
+    [Test]
+    public void Normal_NoPassToTurnOnto_SoundsOnce_UntilUTurnIsSwitchedOff()
+    {
+        // 20 rows skipped: the passes 21 away either side are outside the field.
+        var bench = new Bench(skipRows: 20);
+        var (guidance, turn) = bench.OnPass(0);
+
+        var first = bench.Tick(guidance, turn);
+        var second = bench.Tick(guidance, turn);
+        bench.SwitchedOff();
+        var afterOff = bench.Tick(guidance, turn);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(turn.TurnPath, Is.Null);
+            Assert.That(first.StatusMessage, Does.Contain("End of field"));
+            Assert.That(first.TurnCreationFailedSound, Is.True, "the operator must take over: say so");
+            Assert.That(second.TurnCreationFailedSound, Is.False, "once, not every cycle");
+            Assert.That(afterOff.TurnCreationFailedSound, Is.True, "U-turn off and on: again");
+        });
+    }
+
     // ── Normal: the work goes on across the field (#523) ──────────────────
 
     [Test]
@@ -239,8 +340,13 @@ public class DirectionSwapTests
         private readonly YouTurnStateMachine _sm;
         private readonly Boundary _boundary;
         private readonly List<Vec3> _turnLine;
-        private readonly int _skipRows;
-        private readonly bool _skipWorked, _alternate;
+        private readonly bool _skipWorked;
+
+        /// <summary>Alternative skip mode; the operator can switch it at any time.</summary>
+        public bool Alternate { get; set; }
+
+        /// <summary>The skip; changing it is what the pipeline does on the skip buttons.</summary>
+        public int SkipRows { get; set; }
         private double _x;
 
         public Models.Track.Track Track { get; }
@@ -274,9 +380,9 @@ public class DirectionSwapTests
             };
             _turnLine = offset.CalculatePointHeadings(offset.CreateInwardOffset(outer, 16.0)!);
             Track = Models.Track.Track.FromABLine("AB", new Vec3(0, -100, 0), new Vec3(0, 100, 0));
-            _skipRows = skipRows;
+            SkipRows = skipRows;
             _skipWorked = skipWorked;
-            _alternate = alternate;
+            Alternate = alternate;
         }
 
         /// <summary>The tractor on pass <paramref name="pass"/>, heading north, 64 m before the turn line.</summary>
@@ -289,9 +395,9 @@ public class DirectionSwapTests
         private YouTurnStateMachine.TickContext Ctx() => new(
             new Position { Easting = _x, Northing = -20, Heading = 0, Speed = 2.78 },
             Track, _boundary, _turnLine,
-            UTurnSkipRows: _skipRows, IsSkipWorkedMode: _skipWorked,
+            UTurnSkipRows: SkipRows, IsSkipWorkedMode: _skipWorked,
             HeadlandCalculatedWidth: 16.0, HeadlandDistance: 16.0,
-            IsAlternateSkipMode: _alternate);
+            IsAlternateSkipMode: Alternate);
 
         public YouTurnEffects Tick(GuidanceWorkingState guidance, YouTurnWorkingState turn)
         {
@@ -299,6 +405,8 @@ public class DirectionSwapTests
             Assert.That(turn.IsExecuting, Is.False, "the tractor is still far short of the turn");
             return effects;
         }
+
+        public void SwitchedOff() => _sm.OnYouTurnSwitchedOff();
 
         public void Complete(GuidanceWorkingState guidance, YouTurnWorkingState turn) =>
             _sm.CompleteFromGuidance(Ctx(), guidance, turn);
