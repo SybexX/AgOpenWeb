@@ -21,6 +21,8 @@ public static partial class RemoteServerWiring
     internal static readonly System.Collections.Generic.HashSet<string> ObserverIds = new()
     {
         "boundary.refresh", // rebuilds the boundary menu list from the open field
+        "lists.refresh",    // a panel showing fields, jobs or profiles opened: read them again (#604)
+        "import.scan",      // lists the Import folder for a picker that opened
     };
 
     /// <summary>Parse a whole-number setting, rounding a decimal ("12.5" → 13) rather than
