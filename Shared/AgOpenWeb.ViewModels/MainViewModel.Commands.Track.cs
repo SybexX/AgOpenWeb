@@ -172,7 +172,7 @@ public partial class MainViewModel
             IsVisible = true,
             IsClosed = false,
         };
-        SavedTracks.Add(track);
+        AddSavedTrack(track);
         SelectedTrack = track;
         SaveTracksToFile();
         StatusMessage = $"Created boundary curve ({curvePoints.Count} points)";
@@ -458,7 +458,7 @@ public partial class MainViewModel
                 isClosed: false);
 
             // Add track and select it as active (SelectedTrack setter handles IsActive and map update)
-            SavedTracks.Add(newTrack);
+            AddSavedTrack(newTrack);
             SelectedTrack = newTrack;
             SaveTracksToFile();
 
@@ -558,7 +558,7 @@ public partial class MainViewModel
             }
 
             // Add track and select it as active (SelectedTrack setter handles IsActive and map update)
-            SavedTracks.Add(newTrack);
+            AddSavedTrack(newTrack);
             SelectedTrack = newTrack;
             SaveTracksToFile();
 
@@ -676,6 +676,18 @@ public partial class MainViewModel
             {
                 if (PendingPointA != null)
                 {
+                    // A and B on one spot have no direction: atan2(0, 0) made a line due north
+                    // that the operator never drew (a double tap on the map, Set B pressed
+                    // before moving). The same 1 m as Lat/Lon A-B; B can still be set once the
+                    // tractor has moved or the next tap lands elsewhere.
+                    double dE = pointToSet.Easting - PendingPointA.Easting;
+                    double dN = pointToSet.Northing - PendingPointA.Northing;
+                    if (dE * dE + dN * dN < 1.0)
+                    {
+                        ReportFailure("A and B must be at least 1 m apart");
+                        return;
+                    }
+
                     // Deactivate all existing tracks before adding the new one
                     foreach (var existingTrack in SavedTracks)
                     {
@@ -701,7 +713,7 @@ public partial class MainViewModel
                         extendedB);
 
                     // Add track and select it as active (SelectedTrack setter handles IsActive and map update)
-                    SavedTracks.Add(newTrack);
+                    AddSavedTrack(newTrack);
                     SelectedTrack = newTrack;
                     SaveTracksToFile();
                     StatusMessage = $"Created AB line: {newTrack.Name} ({heading:F1})";
@@ -1062,6 +1074,16 @@ public partial class MainViewModel
                 return;
             }
 
+            // Settings the guidance cannot steer with, however they got there (a profile from
+            // before the settings had ranges, a hand-edited file): a wheelbase of 0 never steers,
+            // a negative one steers away from the line, an overlap as wide as the implement
+            // puts every pass on one line.
+            if (!IsAutoSteerEngaged && Models.Configuration.VehicleToolLimits.WhyCannotSteer(ConfigStore) is { } cannot)
+            {
+                ReportFailure("AutoSteer not available - " + cannot);
+                return;
+            }
+
             // Engagement has no boundary/headland preconditions.
             //  - No boundary: AB-lines-only workflow with manual sections.
             //  - Boundary but no headland: auto-uturn still works against a
@@ -1365,7 +1387,7 @@ public partial class MainViewModel
                 IsVisible = true
             };
 
-            SavedTracks.Add(track);
+            AddSavedTrack(track);
             SaveTracksToFile(); // persist now, not only on field close (#107) — before selecting, so the
                                 // previous track's live pass/nudge isn't written onto the new one
             SelectedTrack = track;
@@ -1397,7 +1419,7 @@ public partial class MainViewModel
                 IsVisible = true
             };
 
-            SavedTracks.Add(track);
+            AddSavedTrack(track);
             SaveTracksToFile(); // persist now, not only on field close (#107) — before selecting, so the
                                 // previous track's live pass/nudge isn't written onto the new one
             SelectedTrack = track;
@@ -1458,7 +1480,7 @@ public partial class MainViewModel
                 IsClosed = true
             };
 
-            SavedTracks.Add(track);
+            AddSavedTrack(track);
             SaveTracksToFile(); // persist now, not only on field close (#107) — before selecting, so the
                                 // previous track's live pass/nudge isn't written onto the new one
             SelectedTrack = track;
@@ -1476,7 +1498,7 @@ public partial class MainViewModel
 
             // A straight edge becomes an AB line, a curved one an AB curve (#365).
             var edges = Models.Track.BoundaryEdgeTracks.Build(boundary.Points);
-            foreach (var t in edges) SavedTracks.Add(t);
+            foreach (var t in edges) AddSavedTrack(t);
             int created = edges.Count;
             int curves = edges.Count(t => t.Type == Models.Track.TrackType.Curve);
 
@@ -1820,8 +1842,9 @@ public partial class MainViewModel
     public void CreateAPlusLine(double? headingDeg)
     {
         State.UI.CloseDialog();
+        if (!FieldIsOpen()) return;
         var v = State.Vehicle; // the cycle's pivot (AgOpenGPS pivotAxlePos), not the 5 Hz status mirror
-        if (v.Easting == 0 && v.Northing == 0)
+        if (!HasGpsPosition(v.Easting, v.Northing))
         {
             ReportFailure("No GPS position - cannot create A+ line");
             return;
@@ -1908,7 +1931,7 @@ public partial class MainViewModel
     {
         foreach (var t in SavedTracks) t.IsActive = false;
         var track = Track.FromPivot($"Pivot {DateTime.Now:HH:mm}", center, referenceRadius);
-        SavedTracks.Add(track);
+        AddSavedTrack(track);
         SaveTracksToFile(); // before selecting: the previous track's pass and nudge stay its own
         SelectedTrack = track;
         StatusMessage = $"Created pivot: centre {center.Easting:F1}, {center.Northing:F1}, passes {PassWidth:F1} m apart";
@@ -1951,6 +1974,7 @@ public partial class MainViewModel
     private bool TryLatLonToLocal(double lat, double lon, out GeoCoord local)
     {
         local = default;
+        if (!FieldIsOpen()) return false;
         if (!double.IsFinite(lat) || lat < -90 || lat > 90)
         {
             ReportFailure("Invalid latitude (must be -90 to 90)");
@@ -1980,7 +2004,7 @@ public partial class MainViewModel
         var pointB = new Vec3(e + Math.Sin(headingRad) * 100.0, n + Math.Cos(headingRad) * 100.0, headingRad);
 
         var track = Track.FromABLine(name, pointA, pointB);
-        SavedTracks.Add(track);
+        AddSavedTrack(track);
         SaveTracksToFile(); // persist now, not only on field close (#107) — before selecting, so the
                             // previous track's live pass/nudge isn't written onto the new one
         SelectedTrack = track;

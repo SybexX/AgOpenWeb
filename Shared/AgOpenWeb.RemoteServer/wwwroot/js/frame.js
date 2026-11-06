@@ -82,6 +82,7 @@ function noteInput(e) {
 }
 for (const t of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'keydown'])
   addEventListener(t, noteInput, { capture: true, passive: true });
+let _overlayError = '';
 function skFrame(ts) {
   // rAF runs at the display's rate; a frame that comes too soon is skipped whole (map and DOM
   // overlays). _frameLast advances by the interval, so the average holds on any refresh rate
@@ -104,28 +105,36 @@ function skFrame(ts) {
   // Under a full card drawer the map isn't seen, so it isn't drawn (a tablet's battery); the
   // first frame after it opens draws from the latest state.
   if (skSurface && !CardPane.coversMap) {
-    try { renderSkia(skSurface.getCanvas(), rp); skSurface.flush(); }
+    const _t0 = performance.now();
+    try { renderSkia(skSurface.getCanvas(), rp); skSurface.flush(); noteDrawMs(performance.now() - _t0); }
     catch (e) { ckStatus = 'render err: ' + (e && e.message || e); }
   }
-  // DOM overlays (independent of the GL surface).
-  CardPane.render();
-  updateLightbarText();
-  updateTramLights();
-  updatePassHud();
-  updateHeadlandHud();
-  renderStatusBar();
-  renderSimBar();
-  renderSectionBar();
-  renderBottomNav();
-  renderSettings();
-  renderRightNav();
-  renderUTurnIndicator();
-  renderAbDotLabels(); // #40 — letters beside the dropped AB/curve points
-  renderRoll();
-  renderCampad();
-  renderCharts();
-  renderRollCorr();
-  renderOffsetFix();
+  // DOM overlays (independent of the GL surface). One that throws must not end the frame
+  // loop (a page loaded with a field and a line open could do that before CanvasKit was up):
+  // the next frame is always asked for, and an error is reported once per message.
+  try {
+    CardPane.render();
+    updateLightbarText();
+    updateTramLights();
+    updatePassHud();
+    updateHeadlandHud();
+    renderStatusBar();
+    renderSimBar();
+    renderSectionBar();
+    renderBottomNav();
+    renderSettings();
+    renderRightNav();
+    renderUTurnIndicator();
+    renderAbDotLabels(); // #40 — letters beside the dropped AB/curve points
+    renderRoll();
+    renderCampad();
+    renderCharts();
+    renderRollCorr();
+    renderOffsetFix();
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    if (msg !== _overlayError) { _overlayError = msg; console.error('[frame] overlay error', e); }
+  }
   requestAnimationFrame(skFrame);
 }
 // Start the connection and CanvasKit only now, with every script loaded: their callbacks reach into all of them.
@@ -140,4 +149,8 @@ if (typeof CanvasKitInit === 'function') {
 } else {
   ckStatus = 'loader missing';
 }
+// How this browser draws (alerts.js, for the bug report dump): once the frame rate has settled,
+// then every minute, so a reconnected or long-running page is current too.
+setTimeout(sendClientDiag, 10000);
+setInterval(sendClientDiag, 60000);
 skFrame();
