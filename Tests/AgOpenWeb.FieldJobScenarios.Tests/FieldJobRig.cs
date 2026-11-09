@@ -66,12 +66,13 @@ public sealed class FieldJobRig : IAsyncDisposable
     private readonly HostLoopDispatcher _hostLoop;
     /// <summary>The 100 Hz control loop, advanced by the harness (<see cref="TickLoop"/>).</summary>
     public ManualSteerMachineLoop Loop => Services.GetRequiredService<ManualSteerMachineLoop>();
-    /// <summary>Runs the control loop <paramref name="times"/> times, with the wall clock's
-    /// timestamp (the position estimator stamps fixes with it).</summary>
+    /// <summary>Runs the control loop <paramref name="times"/> times, with AgOpenWeb's clock's
+    /// timestamp (the position estimator stamps fixes with it): the wall clock, or the job's
+    /// simulated time where the job sets one (<see cref="SimClock"/>).</summary>
     public void TickLoop(int times)
     {
         var loop = Loop;
-        for (int i = 0; i < times; i++) loop.Tick(System.Diagnostics.Stopwatch.GetTimestamp());
+        for (int i = 0; i < times; i++) loop.Tick(AgOpenWeb.Models.Timing.Clock.Current.GetTimestamp());
     }
 
     private FieldJobRig(string dataRoot, IServiceProvider sp, MainViewModel vm,
@@ -126,25 +127,36 @@ public sealed class FieldJobRig : IAsyncDisposable
         WebBackend.WireCrossServices(sp);
         var vm = await OnLoop(hostLoop, () => sp.GetRequiredService<MainViewModel>());
 
-        var server = new AgOpenWeb.RemoteServer.RemoteServerHost();
-        await server.StartAsync(
-            sp.GetRequiredService<ApplicationState>(),
-            sp.GetRequiredService<ICoverageMapService>(),
-            sp.GetRequiredService<ISectionControlService>(),
-            sp.GetRequiredService<IToolPositionService>(),
-            sp.GetRequiredService<AgOpenWeb.Models.Configuration.ConfigurationStore>(),
-            sp.GetRequiredService<IJobService>(),
-            configService,
-            sp.GetRequiredService<IAutoSteerService>(),
-            sp.GetRequiredService<ISmartWasCalibrationService>(),
-            sp.GetRequiredService<IUdpCommunicationService>(),
-            sp.GetRequiredService<INtripProfileService>(),
-            sp.GetRequiredService<IFieldService>(),
-            sp.GetRequiredService<ISettingsService>(),
-            sp.GetRequiredService<IVehicleProfileService>(),
-            sp.GetRequiredService<IPersistentStateService>(),
-            sp.GetService<INtripClientService>(),
-            port: FreePort());
+        // FreePort hands back a port the OS had free a moment ago; something can take it before
+        // the server binds it ("Address already in use", seen 2026-11-08): try a fresh one.
+        AgOpenWeb.RemoteServer.RemoteServerHost server = null!;
+        for (int attempt = 1; ; attempt++)
+        {
+            server = new AgOpenWeb.RemoteServer.RemoteServerHost();
+            try
+            {
+                await server.StartAsync(
+                    sp.GetRequiredService<ApplicationState>(),
+                    sp.GetRequiredService<ICoverageMapService>(),
+                    sp.GetRequiredService<ISectionControlService>(),
+                    sp.GetRequiredService<IToolPositionService>(),
+                    sp.GetRequiredService<AgOpenWeb.Models.Configuration.ConfigurationStore>(),
+                    sp.GetRequiredService<IJobService>(),
+                    configService,
+                    sp.GetRequiredService<IAutoSteerService>(),
+                    sp.GetRequiredService<ISmartWasCalibrationService>(),
+                    sp.GetRequiredService<IUdpCommunicationService>(),
+                    sp.GetRequiredService<INtripProfileService>(),
+                    sp.GetRequiredService<IFieldService>(),
+                    sp.GetRequiredService<ISettingsService>(),
+                    sp.GetRequiredService<IVehicleProfileService>(),
+                    sp.GetRequiredService<IPersistentStateService>(),
+                    sp.GetService<INtripClientService>(),
+                    port: FreePort());
+                break;
+            }
+            catch (System.Net.Sockets.SocketException) when (attempt < 3) { }
+        }
         await hostLoop.InvokeAsync(() =>
             RemoteServerWiring.Wire(server, vm, sp, configService, new NoImagery()));
 

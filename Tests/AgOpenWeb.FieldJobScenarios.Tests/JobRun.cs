@@ -32,6 +32,13 @@ public sealed record JobSpec(
     /// <summary>How far inside the boundary the U-turn's outermost point stays (AgOpenWeb default 2 m).</summary>
     public double UTurnDistanceFromBoundary { get; init; } = 2;
     public bool Obstacles { get; init; }
+    /// <summary>The real valves' time from relay to nozzles, s: open, shut. AgOpenGPS's default
+    /// look-ahead (1.0 s on, 0.5 s off) is what it assumes a sprayer's valves take.</summary>
+    public double ValveOnS { get; init; } = 1.0;
+    public double ValveOffS { get; init; } = 0.5;
+    /// <summary>The operator set look-ahead to the valves' times, as a tuned rig is (careful);
+    /// off: look-ahead stays at what the settings say (AgOpenWeb's default 0, or <see cref="Extra"/>).</summary>
+    public bool LookAheadMatchesValves { get; init; } = true;
     /// <summary>The outer boundary marked hard (AgOpenWeb then checks the implement's swept path
     /// in every U-turn and refuses a turn that would cross it).</summary>
     public bool HardBoundary { get; init; }
@@ -46,6 +53,37 @@ public sealed record JobSpec(
     public bool Reengage { get; init; } = true;
     /// <summary>Findings this job is expected to produce (the operator's own doing): noted, not counted.</summary>
     public IReadOnlyList<string> Expected { get; init; } = Array.Empty<string>();
+    /// <summary>How the operator guides the job: the AB line named in <see cref="Track"/> (the
+    /// default), or a curve, a closed loop, a water pivot, contour or a recorded path
+    /// (<see cref="PathOperator"/>).</summary>
+    public GuideKind Guide { get; init; } = GuideKind.AbLine;
+    /// <summary>For <see cref="GuideKind.BoundarySegment"/>: the outer ring's vertices (in the
+    /// field file's order) the operator taps as A and B, and a vertex on the way round between them.</summary>
+    public (int A, int B, int Via) Segment { get; init; }
+    /// <summary>U-turns switched on (AgOpenWeb refuses them on a closed track).</summary>
+    public bool UTurns { get; init; } = true;
+    /// <summary>AgOpenWeb's clock runs on the job's simulated time (<see cref="SimClock"/>), as
+    /// it must where AgOpenWeb times guidance itself (contour rebuilds its line every 2 s).</summary>
+    public bool SimulatedClock { get; init; }
+}
+
+/// <summary>How the operator guides a job.</summary>
+public enum GuideKind
+{
+    /// <summary>An AB line from the field file (<see cref="JobSpec.Track"/>).</summary>
+    AbLine,
+    /// <summary>"Bnd. Curve": an open curve along part of the outer boundary, tapped A and B.</summary>
+    BoundarySegment,
+    /// <summary>"Boundary Curve": the whole outer boundary as a closed loop, worked lap by lap inwards.</summary>
+    BoundaryLoop,
+    /// <summary>A water pivot from its centre typed in (lat/lon), worked circle by circle inwards.</summary>
+    PivotCentre,
+    /// <summary>A water pivot recorded by driving part of the way round it.</summary>
+    PivotDriven,
+    /// <summary>No line: the first lap by hand, then contour guidance follows the strips.</summary>
+    Contour,
+    /// <summary>A path recorded by driving it, then played back.</summary>
+    RecordedPath,
 }
 
 /// <summary>What one U-turn did.</summary>
@@ -59,7 +97,7 @@ public sealed class TurnRecord
     public bool Fallback;               // AgOpenWeb used its simple fallback path for this turn
     public bool Left;
     public double MinSpeedKmh = 99;
-    public double HeadingAtStart, UAtStart;
+    public double HeadingAtStart, UAtStart, TangentAtStart;
     /// <summary>Seconds into the turn when the tractor was back on a pass line, facing the other
     /// way, inside the cultivated area (the turn done on the ground); -1 if never seen.</summary>
     public double BackOnPassSeconds = -1;
@@ -82,6 +120,36 @@ public sealed class JobRun : IAsyncDisposable
 
     public JobSpec Spec { get; }
     public Scenario S { get; }
+    /// <summary>The passes' coordinates (u across, v along) from the operator's reference line.</summary>
+    public PassFrame Frame { get; set; } = null!;
+    /// <summary>What the operator does on a curve, loop, pivot, contour or recorded path job.</summary>
+    public PathOperator? PathOp { get; private set; }
+    /// <summary>AgOpenWeb's clock when the job runs on simulated time.</summary>
+    public SimClock? SimTime { get; private set; }
+    /// <summary>The operator steers by hand (degrees asked of the wheels); null = AgOpenWeb steers.</summary>
+    public Func<double>? HandSteer;
+    /// <summary>AutoSteer should be on: when it drops, that is reported and the operator engages it again.</summary>
+    public bool ExpectEngaged = true;
+    /// <summary>Moving over to the next lap: the pass edges are not recorded.</summary>
+    public bool InChange;
+    /// <summary>A lap's corner (set by the path operator): the pass edges and the pass error
+    /// leave it out, as the U-turns.</summary>
+    public bool InCorner;
+    /// <summary>Unsprayed ground the operator left on purpose (the middle no lap reaches): not a
+    /// strip between passes.</summary>
+    public Func<(double E, double N), bool>? LeftOnPurpose;
+    /// <summary>Unsprayed ground at a lap's corner, where the passes pull apart.</summary>
+    public Func<(double E, double N), bool>? AtCorner;
+    private bool _passJoined;
+    private int _passErrorTraced = -1000;
+    /// <summary>The operator numbers the passes (contour, recorded path): AgOpenWeb's pass number is not read.</summary>
+    public bool PassFromOperator;
+    /// <summary>Who ended the job and why (for a job AgOpenWeb does not end itself).</summary>
+    public string EndedBy = "";
+    /// <summary>The implement's centre against the pass it should be on (curve, loop and pivot jobs):
+    /// the worst distance, where, and the mean.</summary>
+    public double PassErrorWorst, PassErrorSum; public int PassErrorSamples; public (double E, double N, int Pass, double V) PassErrorWhere;
+    public readonly List<(double Err, double E, double N, int Pass, double V)> PassErrorBig = new();
     public FieldJobRig Rig { get; private set; } = null!;
     public EmulatedSprayerModule Module { get; private set; } = null!;
     public SteerModuleStub Steer { get; private set; } = null!;
@@ -114,10 +182,15 @@ public sealed class JobRun : IAsyncDisposable
     /// emulated module's clock.</summary>
     public long SimMs;
     public bool InTurn, FieldDone, Stopped;
+    /// <summary>The operator stopped the job because AgOpenWeb went wrong (a finding says how):
+    /// the ground left is its consequence, not judged again.</summary>
+    public bool EndedEarly;
     /// <summary>False = the receiver sends nothing (a careless operator's GPS loss).</summary>
     public volatile bool GpsOn = true;
     public int Pass = int.MinValue;
     public int TurnsStarted;
+    /// <summary>When AgOpenWeb asked the operator to take over (a refused U-turn), s; -1 never.</summary>
+    public double TookOverAt = -1;
     bool _arrowChecked;
     /// <summary>Set when AgOpenWeb's first U-turn arrow pointed at the field's edge the operator
     /// started from (a sliver pass): the pass it pointed at and how much of it is inside.</summary>
@@ -154,6 +227,8 @@ public sealed class JobRun : IAsyncDisposable
         }
     }
     private readonly Dictionary<int, SortedDictionary<int, (double L, double R)>> _passEdges = new();
+    /// <summary>The passes driven: from the lowest to the highest pass number recorded.</summary>
+    public int PassesDriven => _passEdges.Count == 0 ? 1 : _passEdges.Keys.Max() - _passEdges.Keys.Min() + 1;
     private readonly (double E, double N)?[] _prevEdge = new (double E, double N)?[65];
 
     public JobRun(JobSpec spec, Scenario s) { Spec = spec; S = s; }
@@ -174,8 +249,13 @@ public sealed class JobRun : IAsyncDisposable
     public async Task<bool> SetUpAsync(string dataRoot)
     {
         var T = Spec.T;
+        if (Spec.SimulatedClock)
+        {
+            SimTime = new SimClock();
+            AgOpenWeb.Models.Timing.Clock.Set(SimTime);
+        }
         Module = new EmulatedSprayerModule(relays: T.Sections > 16 ? T.Sections : Math.Max(8, T.Sections), directSections: T.Sections > 16)
-        { Clock = () => SimMs };
+        { Clock = () => SimMs, ValveOnDelayS = Spec.ValveOnS, ValveOffDelayS = Spec.ValveOffS };
         Module.Start();
         Module.PowerOn();
         Steer = new SteerModuleStub { On = true };
@@ -192,6 +272,11 @@ public sealed class JobRun : IAsyncDisposable
         settings.Add("tool.isHeadlandSectionControl:" + (Spec.HeadlandSections ? "1" : "0"));
         settings.Add(F($"uturn.radius:{Spec.UTurnRadius}"));
         settings.Add(F($"uturn.distanceFromBoundary:{Spec.UTurnDistanceFromBoundary}"));
+        if (Spec.LookAheadMatchesValves)
+        {
+            settings.Add(F($"tool.lookAheadOn:{Spec.ValveOnS}"));
+            settings.Add(F($"tool.lookAheadOff:{Spec.ValveOffS}"));
+        }
         settings.AddRange(Spec.Extra);
         foreach (var kv in settings) await SendAsync("config.set", kv);
         await SendAsync("profile.save");
@@ -216,6 +301,13 @@ public sealed class JobRun : IAsyncDisposable
         int appInner = await Rig.ReadAsync(() => Rig.State.Field.CurrentBoundary?.InnerBoundaries.Count ?? 0);
         S.Step(F($"field open: {Ring.Area(Outer) / 1e4:0.00} ha, {Inner.Count} obstacles in the file, {appInner} in AgOpenWeb"));
 
+        if (Spec.Guide != GuideKind.AbLine)
+        {
+            PathOp = PathOperator.For(Spec.Guide);
+            if (!await PathOp.CreateTrackAsync(this)) return false;
+        }
+        else
+        {
         // The track, as the operator made it on the map: its first and last point.
         var tr = Field.Tracks.FirstOrDefault(t => t.Name == Spec.Track);
         if (tr.Points == null || tr.Points.Count < 2) { Harness($"no track '{Spec.Track}' in field '{Spec.Field}'"); return false; }
@@ -230,6 +322,8 @@ public sealed class JobRun : IAsyncDisposable
         Across = (Along.N, -Along.E);
         double abHeading = Math.Atan2(Along.E, Along.N) * 180 / Math.PI;
         S.Step(F($"AB line '{Spec.Track}' at {(abHeading + 360) % 360:0}°, active"));
+        Frame = new StraightFrame(A, Along);
+        }
 
         if (Spec.HeadlandM > 0)
         {
@@ -239,9 +333,12 @@ public sealed class JobRun : IAsyncDisposable
             Work = await Rig.ReadAsync(() => Rig.State.Field.HeadlandLine!.Select(p => (p.Easting, p.Northing)).ToList());
             S.Step(F($"headland {Spec.HeadlandM} m from the whole boundary: {Work.Count} points, {Ring.Area(Work) / 1e4:0.00} ha inside; section control in the headland {(Spec.HeadlandSections ? "on" : "off")}"));
         }
+        if (Spec.UTurns)
+        {
         if (!await Rig.ReadAsync(() => Rig.Vm.IsYouTurnEnabled)) await SendAsync("youturn.toggle");
         if (!await Rig.ReadAsync(() => Rig.Vm.IsYouTurnEnabled)) { Harness("U-turns did not switch on"); return false; }
         S.Step(F($"U-turns on (radius {Spec.UTurnRadius} m, {(Spec.OffWhenOut ? "off outside boundary" : "sections stay on at the edge")})"));
+        }
         if (Spec.HardBoundary)
         {
             // The toggle acts on the selected boundary row (the outer boundary is row 0).
@@ -275,8 +372,8 @@ public sealed class JobRun : IAsyncDisposable
 
     public Wgs84 Wgs(double e, double n) => Plane.ConvertGeoCoordToWgs84(new GeoCoord(n, e));
 
-    public double U((double E, double N) p) => (p.E - A.E) * Across.E + (p.N - A.N) * Across.N;
-    public double Vv((double E, double N) p) => (p.E - A.E) * Along.E + (p.N - A.N) * Along.N;
+    public double U((double E, double N) p) => Frame.U(p);
+    public double Vv((double E, double N) p) => Frame.V(p);
 
     private void SendFixAt(double lat, double lon, double headingDeg)
     {
@@ -286,7 +383,23 @@ public sealed class JobRun : IAsyncDisposable
         Rig.SendSentence(FieldJobRig.Sentence(sys.Dual, sys.HasImu, lat, lon, headingDeg, 0, 0.5));
     }
 
-    private void SendFix()
+    /// <summary>The tractor rolls on for <paramref name="fixes"/> fixes with the wheels as
+    /// <paramref name="steer"/> asks (straight without), each fix sent and the control loop run;
+    /// nothing is measured (the operator getting ready).</summary>
+    public async Task RollAsync(int fixes, Func<double>? steer = null)
+    {
+        for (int i = 0; i < fixes; i++)
+        {
+            SimMs += 100;
+            Truth.Advance(FixSeconds, steer?.Invoke() ?? 0);
+            Module.TickNow(); Module.TickNow();
+            SendFix();
+            for (int t = 0; t < 10; t++) { SimTime?.AdvanceMs(10); Rig.TickLoop(1); }
+            await Task.Delay(PaceMs);
+        }
+    }
+
+    public void SendFix()
     {
         var (ae, an) = Truth.Antenna;
         var w = Wgs(ae, an);
@@ -304,6 +417,18 @@ public sealed class JobRun : IAsyncDisposable
     {
         var work = Work ?? Outer;
         double u = (k + 0.5) * Spacing;
+        if (Frame is not StraightFrame)
+        {
+            // Walk pass k's line in 1 m steps (past the ends of an open curve too).
+            double len = Frame.Closed ? Frame.Length : Frame.Length + 400;
+            double v0 = Frame.Closed ? 0 : -200, run = 0, longest = 0;
+            for (double v = v0; v <= v0 + len; v += 1)
+            {
+                if (Ring.Inside(Frame.At(u, v), work) && !Inner.Any(i => !i.DriveThrough && Ring.Inside(Frame.At(u, v), i.Ring))) longest = Math.Max(longest, ++run);
+                else run = 0;
+            }
+            return longest;
+        }
         var onLine = (A.E + Across.E * u, A.N + Across.N * u);
         var ts = Ring.LineCrossings(onLine, Along, work);
         ts.Sort();
@@ -353,6 +478,13 @@ public sealed class JobRun : IAsyncDisposable
 
     public async Task<bool> DriveAsync()
     {
+        if (PathOp != null)
+        {
+            SimTime?.Step();
+            if (!await PathOp.StartAsync(this)) return false;
+        }
+        else
+        {
         var (pivot, hdg, k0) = StartPose();
         Truth.Place(pivot.E, pivot.N, hdg);
         S.Step(F($"tractor put at the start of pass {k0} ({pivot.E:0},{pivot.N:0}), 12 m before the boundary, heading {hdg * 180 / Math.PI:0}°"));
@@ -363,6 +495,7 @@ public sealed class JobRun : IAsyncDisposable
         await SendAsync("section.master");
         if (!await Rig.ReadAsync(() => Rig.Vm.IsSectionMasterOn)) { Harness("the section master did not switch to Auto"); return false; }
         S.Step("AutoSteer engaged, sections Auto; AgOpenWeb drives from here");
+        }
 
         double workArea = Ring.Area(Work ?? Outer);
         int maxFixes = (int)(workArea / (Spec.T.Width * Spec.SpeedKmh / 3.6) / FixSeconds * 3) + 6000;
@@ -384,7 +517,7 @@ public sealed class JobRun : IAsyncDisposable
             Module.TickNow(); Module.TickNow();   // the module's 50 ms loop, twice per 100 ms fix
             _pivotHistory[Fix % _pivotHistory.Length] = (Truth.E, Truth.N);
             if (GpsOn) SendFix();
-            for (int t = 0; t < 10; t++) { Rig.TickLoop(1); SweepMapping(); }   // the 100 Hz section/steer loop, in simulated time
+            for (int t = 0; t < 10; t++) { SimTime?.AdvanceMs(10); Rig.TickLoop(1); SweepMapping(); }   // the 100 Hz section/steer loop, in simulated time
             var c = Rig.LastCycle;
             if (c != null && Fix > _pivotHistory.Length && !InTurn)
             {
@@ -404,11 +537,12 @@ public sealed class JobRun : IAsyncDisposable
                 bool steers = engaged && !(c.IsReverse && !Rig.Store.AutoSteer.SteerInReverse);
                 cmd = steers && c.Guidance is { HasGuidance: true } g ? g.SteerAngle : 0;
                 if (!double.IsFinite(cmd)) { Problems.Add(F($"fix {Fix}: steer angle {cmd} sent to the module")); cmd = 0; }
+                if (HandSteer != null) cmd = HandSteer();
                 var yt = c.YouTurn;
                 bool executing = yt?.IsExecuting == true;
                 if (executing && !wasExecuting)
                 {
-                    turn = new TurnRecord { Index = ++TurnsStarted, PassBefore = lastPassSeen, StartSeconds = Seconds, Left = yt!.IsTurnLeft, HeadingAtStart = Truth.Heading, UAtStart = U((Truth.E, Truth.N)) };
+                    turn = new TurnRecord { Index = ++TurnsStarted, PassBefore = lastPassSeen, StartSeconds = Seconds, Left = yt!.IsTurnLeft, HeadingAtStart = Truth.Heading, UAtStart = U((Truth.E, Truth.N)), TangentAtStart = Frame.TangentHeading((Truth.E, Truth.N)) };
                     saidAtTurnStart = Math.Max(0, Said.Count - 6);
                     Turns.Add(turn);
                     InTurn = true;
@@ -422,7 +556,7 @@ public sealed class JobRun : IAsyncDisposable
                     turn.MinSpeedKmh = Math.Min(turn.MinSpeedKmh, Truth.SpeedKmh);
                     if (turn.BackOnPassSeconds < 0)
                     {
-                        double dh = Math.Abs(Math.IEEERemainder(Truth.Heading - turn.HeadingAtStart - Math.PI, 2 * Math.PI));
+                        double dh = Math.Abs(Math.IEEERemainder((Truth.Heading - Frame.TangentHeading((Truth.E, Truth.N))) - (turn.HeadingAtStart - turn.TangentAtStart) - Math.PI, 2 * Math.PI));
                         double du = Math.Abs(U((Truth.E, Truth.N)) - turn.UAtStart);
                         double onPass = Math.Abs(du / Spacing - Math.Round(du / Spacing)) * Spacing;
                         if (dh < 5 * Math.PI / 180 && du > Spacing / 2 && onPass < 0.3 && Work != null && Ring.Inside((Truth.E, Truth.N), Work))
@@ -452,6 +586,7 @@ public sealed class JobRun : IAsyncDisposable
                     turn.Seconds = Seconds - turn.StartSeconds;
                     InTurn = false;
                     afterTurnUntil = Fix + 200;
+                    _passJoined = false;
                 }
                 // The 20 s after a turn, once a second: where AgOpenWeb thinks the tractor is
                 // (zone and distance to the headland line), to see why a turn is or is not made.
@@ -462,7 +597,7 @@ public sealed class JobRun : IAsyncDisposable
                     Journal.Trace(F($"[fj] {Seconds,7:0.0} s   after turn {TurnsStarted}: AgOpenWeb zone {yt.CurrentZone}, headland {(yt.DistanceToHeadland > 1e6 ? "none" : F($"{yt.DistanceToHeadland:0.0} m"))} ahead, executing {yt.IsExecuting}, path {(yt.TurnPath == null ? "none" : "ready")}; really {where}, u {U((tcc.E, tcc.N)):0.0}, steer {c.IsAutoSteerEngaged}"));
                 }
                 wasExecuting = executing;
-                if (!executing && c.Guidance is { HasGuidance: true } gg)
+                if (!executing && !PassFromOperator && c.Guidance is { HasGuidance: true } gg)
                 {
                     if (gg.HowManyPathsAway != lastPassSeen)
                     {
@@ -470,6 +605,26 @@ public sealed class JobRun : IAsyncDisposable
                         Pass = lastPassSeen;
                         if (turn != null && turn.PassAfter == 0 && turn.Seconds > 0) turn.PassAfter = lastPassSeen;
                         { var tcc = ToolCentre(); Journal.Trace(F($"[fj] {Seconds,7:0.0} s pass {Pass} (truth u {U((tcc.E, tcc.N)):0.00}, {Turns.Count} turns)")); }
+                    }
+                }
+                // Curve, loop and pivot jobs: the implement against the pass it should be on.
+                // Not before the implement first reaches its pass (the start, after a U-turn).
+                if (PathOp != null && engaged && HandSteer == null && !executing && !InChange && !InCorner && Pass != int.MinValue)
+                {
+                    var tcc = Truth.ToolCentre;
+                    double want = PathOp.ExpectedU(this, Pass);
+                    double err = double.IsFinite(want) ? U((tcc.E, tcc.N)) - want : double.NaN;
+                    if (!_passJoined && Math.Abs(err) < 0.3) _passJoined = true;
+                    if (_passJoined && double.IsFinite(err) && !PathOp.PassErrorJudgedElsewhere(this, err))
+                    {
+                        if (Math.Abs(err) > 1.0 && Fix - _passErrorTraced >= 50)
+                        {
+                            _passErrorTraced = Fix;
+                            Journal.Trace(F($"[fj] {Seconds,7:0.0} s   off its pass: pass {Pass}, implement at ({tcc.E:0.0},{tcc.N:0.0}) u {err + want:0.00} for {want:0.00}, AgOpenWeb's cross-track {(c.Guidance?.CrossTrackError ?? double.NaN):0.00} m"));
+                        }
+                        PassErrorSum += Math.Abs(err); PassErrorSamples++;
+                        if (Math.Abs(err) > 1.5 && PassErrorBig.Count < 5000) PassErrorBig.Add((err, tcc.E, tcc.N, Pass, Vv((tcc.E, tcc.N))));
+                        if (Math.Abs(err) > Math.Abs(PassErrorWorst)) { PassErrorWorst = err; PassErrorWhere = (tcc.E, tcc.N, Pass, Vv((tcc.E, tcc.N))); }
                     }
                 }
                 // Screen vs valves, and the truth sweep.
@@ -494,7 +649,7 @@ public sealed class JobRun : IAsyncDisposable
             }
             prevOpen = Module.SectionsOpen;
 
-            if (!engaged && c != null)
+            if (!engaged && c != null && ExpectEngaged)
             {
                 if (offSince < 0) { offSince = Fix; Said.Add(F($"{Seconds:0.0} s: AutoSteer off: {c.DisengageReason ?? "no reason given"}")); }
                 // The careful operator looks up, and after two seconds engages again.
@@ -508,6 +663,7 @@ public sealed class JobRun : IAsyncDisposable
             else offSince = -1;
 
             if (Spec.OnFix != null) await Spec.OnFix(this);
+            if (PathOp != null) await PathOp.OnFixAsync(this);
 
             if (Fix - lastEventCheck >= 10)
             {
@@ -517,6 +673,13 @@ public sealed class JobRun : IAsyncDisposable
                     Said.Add(F($"{Seconds:0.0} s: {e}"));
                     if (e.Contains("End of field reached", StringComparison.Ordinal) || e.Contains("Field complete", StringComparison.Ordinal))
                         FieldDone = true;
+                    // AgOpenWeb refused the turn and said so (#698, #716): the operator takes over
+                    // here and the job stops, instead of riding on with AutoSteer out of the field.
+                    if (e.Contains("No U-turn fits", StringComparison.Ordinal) && TookOverAt < 0)
+                    {
+                        TookOverAt = Seconds;
+                        Problems.Add(F($"{Seconds:0.0} s: AgOpenWeb refused the U-turn at the end of pass {Pass} and asked the operator to take over (\"{e}\")"));
+                    }
                 }
             }
             var tc = ToolCentre();
@@ -527,13 +690,14 @@ public sealed class JobRun : IAsyncDisposable
                 else if (inWorkSinceEnd || (leftWorkAt >= 0 && Seconds - leftWorkAt > 6)) break;
                 if (!inWork && leftWorkAt < 0) leftWorkAt = Seconds;
             }
+            if (TookOverAt >= 0) break;
             double far = OutsideBoundaryM().Worst;
             if (far > 25) { Problems.Add(F($"{Seconds:0.0} s: the tractor ran {far:0} m out of the field on pass {Pass}")); break; }
             if (Fix % 10 == 0) await Task.Delay(PaceMs * 10);
         }
         CyclesAtEnd = Rig.CycleCount; FixesAtEnd = Fix;
         if (Fix >= maxFixes) Problems.Add(F($"stopped after {Seconds / 60:0} simulated minutes without AgOpenWeb reporting the end of the field"));
-        S.Step(F($"drove {Seconds / 60:0.0} simulated minutes, {Turns.Count} U-turns, passes {_passEdges.Keys.DefaultIfEmpty(0).Min()}..{_passEdges.Keys.DefaultIfEmpty(0).Max()}; {(FieldDone ? "AgOpenWeb reported the end of the field" : "the field was not reported done")}"));
+        S.Step(F($"drove {Seconds / 60:0.0} simulated minutes, {Turns.Count} U-turns, passes {_passEdges.Keys.DefaultIfEmpty(0).Min()}..{_passEdges.Keys.DefaultIfEmpty(0).Max()}; {(FieldDone ? (EndedBy.Length > 0 ? EndedBy : "AgOpenWeb reported the end of the field") : "the field was not reported done")}"));
         if (await Rig.ReadAsync(() => Rig.Vm.IsSectionMasterOn)) await SendAsync("section.master");
         if (await Rig.ReadAsync(() => Rig.Vm.IsAutoSteerEngaged)) await SendAsync("autosteer.toggle");
         for (int i = 0; i < 10; i++) { Truth.Advance(FixSeconds, 0); SendFix(); await Task.Delay(PaceMs); }
@@ -545,7 +709,7 @@ public sealed class JobRun : IAsyncDisposable
 
     /// <summary>How far the pivot or an implement end is past the outer boundary, 0 inside.</summary>
     /// <summary>How far past the outer boundary the pivot or an implement end is (0 inside), and the pivot alone.</summary>
-    private (double Worst, double Pivot) OutsideBoundaryM()
+    public (double Worst, double Pivot) OutsideBoundaryM()
     {
         double worst = 0, pivot = 0;
         var tc = Truth.ToolCentre;
@@ -562,7 +726,8 @@ public sealed class JobRun : IAsyncDisposable
         double re = Math.Cos(tc.Heading), rn = -Math.Sin(tc.Heading);
         int n = Spec.T.Sections;
         double sw = Spec.T.Width / n, left = -Spec.T.Width / 2;
-        ulong open = Module.SectionsOpen;
+        ulong open = Module.SectionsOpen;       // the relays: what the module was told
+        ulong spray = Module.SectionsSpraying;  // the nozzles: the relays after the valves' time
         bool link = Module.LinkOk;
         if (!link) SecondsLinkDown += FixSeconds;
         var ss = c.SectionStates;
@@ -579,15 +744,18 @@ public sealed class JobRun : IAsyncDisposable
         }
         for (int s = 0; s < n && s < 64; s++)
         {
-            bool valve = ((open >> s) & 1) != 0;
+            // What must match the screen is the product at the nozzles: the relays rightly lead the
+            // screen by the look-ahead (#714), the valves then take that long, and the two meet.
+            bool valve = ((spray >> s) & 1) != 0;
             bool screen = ss != null && s < ss.Length && ss[s];
             if (screen && !valve) { ScreenOnValveShut[s] += FixSeconds; if (!link) SecondsPaintingLinkDown += FixSeconds / n; }
             if (!screen && valve) ScreenOffValveOpen[s] += FixSeconds;
             if (screen != valve) { if (++_disagreeRun[s] > 10) PersistentDisagreement[s] += FixSeconds; }
             else _disagreeRun[s] = 0;
-            if (valve && _prevEdge[s] is { } p0 && _prevEdge[s + 1] is { } p1)
+            bool flowing = ((spray >> s) & 1) != 0;
+            if (flowing && _prevEdge[s] is { } p0 && _prevEdge[s + 1] is { } p1)
                 Grid.Sweep(p0, p1, cur[s], cur[s + 1]);
-            if (valve)
+            if (flowing)
             {
                 any = true;
                 uL = Math.Min(uL, Math.Min(U(cur[s]), U(cur[s + 1])));
@@ -607,14 +775,17 @@ public sealed class JobRun : IAsyncDisposable
                     ScreenGrid.Sweep(q0, q1, acur[s], acur[s + 1]);
             for (int s = 0; s <= n; s++) _prevAppEdge[s] = acur[s];
         }
-        if (any && !InTurn && Pass != int.MinValue)
+        // Curve, loop and pivot jobs: only where the implement is on its pass; where AgOpenWeb's
+        // line strays from the reference offset, OFF-ITS-PASS says so and the edges would not compare.
+        bool onItsPass = PathOp == null || !(Math.Abs((uL + uR) / 2 - PathOp.ExpectedU(this, Pass)) > 1.0);
+        if (any && !InTurn && !InChange && !InCorner && onItsPass && Pass != int.MinValue)
         {
             if (!_passEdges.TryGetValue(Pass, out var d)) _passEdges[Pass] = d = new SortedDictionary<int, (double, double)>();
             int bin = (int)Math.Floor(Vv((tc.E, tc.N)));
             if (d.TryGetValue(bin, out var old)) d[bin] = (Math.Min(old.L, uL), Math.Max(old.R, uR));
             else d[bin] = (uL, uR);
         }
-        Track.Add((Truth.E, Truth.N, InTurn, open != 0));
+        Track.Add((Truth.E, Truth.N, InTurn || InChange || HandSteer != null, open != 0));
     }
 
     /// <summary>After a control-loop tick: the strip each mapping section swept since the last tick,
@@ -725,6 +896,10 @@ public sealed class JobRun : IAsyncDisposable
                     if (Work != null && Ring.DistToRing(c, Work) < 3) a.MissedAtEnds += cell;
                     // Within 2 m of an obstacle: the sections closing over it and opening again.
                     else if (g.Near(i, j => (g.Zone[j] & (TruthGrid.InObstacle | TruthGrid.InDriveThrough)) != 0, 10)) a.MissedAtObstacles += cell;
+                    // No headland (the lap jobs): the edge of the field along the boundary.
+                    else if (Work == null && Ring.DistToRing(c, Outer) < 1.5) a.MissedAlongBoundary += cell;
+                    else if (LeftOnPurpose?.Invoke(c) == true) a.MissedLeftInMiddle += cell;
+                    else if (AtCorner?.Invoke(c) == true) a.MissedAtCorners += cell;
                     else if (SprayedAcross(i, +1, reach) && SprayedAcross(i, -1, reach)) { a.MissedBetweenPasses += cell; a.MissedBetweenE += c.E * cell; a.MissedBetweenN += c.N * cell; }
                 }
                 if (t >= 2) a.Twice += cell;
@@ -775,9 +950,26 @@ public sealed class JobRun : IAsyncDisposable
         return a;
     }
 
+    /// <summary>The share of the cultivated area (inside the headland line, outside obstacles)
+    /// no valve has sprayed yet: what the operator sees left on the map.</summary>
+    public double UnsprayedShare()
+    {
+        var g = Grid;
+        long work = 0, left = 0;
+        for (int i = 0; i < g.Count.Length; i++)
+        {
+            byte z = g.Zone[i];
+            if ((z & TruthGrid.InWork) == 0 || (z & (TruthGrid.InObstacle | TruthGrid.InDriveThrough)) != 0) continue;
+            work++;
+            if (g.Count[i] == 0) left++;
+        }
+        return work == 0 ? 0 : (double)left / work;
+    }
+
     private bool SprayedAcross(int i, int dir, int reach)
     {
         var c = Grid.Centre(i);
+        var Across = Frame.AcrossDir(c);
         for (int k = 1; k <= reach; k++)
         {
             int j = Grid.Index(c.E + Across.E * dir * k * TruthGrid.Cell, c.N + Across.N * dir * k * TruthGrid.Cell);
@@ -791,8 +983,16 @@ public sealed class JobRun : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        try { Steer?.Dispose(); } catch { }
-        try { Module?.Dispose(); } catch { }
-        try { if (Rig != null) await Rig.DisposeAsync(); } catch { }
+        try
+        {
+            try { Steer?.Dispose(); } catch { }
+            try { Module?.Dispose(); } catch { }
+            try { if (Rig != null) await Rig.DisposeAsync(); } catch { }
+        }
+        finally
+        {
+            // Only once the backend is gone: it would see its clock jump back while shutting down.
+            if (SimTime != null) AgOpenWeb.Models.Timing.Clock.Reset();
+        }
     }
 }

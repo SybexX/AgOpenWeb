@@ -16,11 +16,17 @@ Three things stand around it:
   at 10 Hz, and the steer angle AgOpenWeb sends the steer module (PGN 254) steers it back.
 - **An emulated machine module** (`EmulatedSprayerModule.cs`, the Sprayer_ESP32 firmware's PGN
   handling) on 127.0.0.1:8888: it keeps PGN 235/236/238 in its flash, answers hellos, and opens
-  the valves PGN 239 (and 229 above 16 sections) asks for, shutting them 2 s after the last one.
+  the relays PGN 239 (and 229 above 16 sections) asks for, shutting them 2 s after the last one.
   An implement with more than 16 sections drives relay i from section i, as the Seeder_ESP32.
+  Behind each relay is a **valve with its own time**: product reaches the nozzles 1.0 s after
+  the relay closes and stops 0.5 s after it opens (`JobSpec.ValveOnS` / `ValveOffS`, AgOpenGPS's
+  default look-ahead, which is what it assumes a sprayer takes). Look-ahead is there to cover
+  that time, so the careful operator sets it to the valves' (`LookAheadMatchesValves`); C8 and
+  C16 don't.
 - **The truth coverage** (`TruthGrid.cs`): a 0.2 m grid over the field. Each fix, every section
   whose valve is open sweeps the strip between its previous and current ends into the grid.
-  So the grid holds where chemical really went, counted per pass, and knows for each cell
+  The sweep follows the nozzles, not the relays: since #714 the relays rightly lead the screen
+  by the look-ahead. So the grid holds where chemical really went, counted per pass, and knows for each cell
   whether it lies inside the boundary, inside the headland line, or inside an obstacle.
 
 A job (`JobRun.cs`): AgOpenWeb boots fresh; the operator types the Vehicle & Tool settings
@@ -46,7 +52,9 @@ its neighbours':
 | A U-turn that took the tractor or an implement end past the boundary | `TURN-OUTSIDE-BOUNDARY` |
 | U-turns missed or cancelled, AutoSteer dropping out | `TURN-MISSED`, `AUTOSTEER-DROPPED` |
 | The first U-turn arrow pointing at the edge the operator started from | `FIRST-TURN-TOWARD-EDGE` |
-| The screen's sections and the valves disagreeing | `VALVES-NOT-FOLLOWING`, `SECTION-WITHOUT-RELAY` |
+| The screen's sections and the nozzles disagreeing | `VALVES-NOT-FOLLOWING`, `SECTION-WITHOUT-RELAY` |
+| AgOpenWeb refused a U-turn and asked the operator to take over (the job stops there) | `TURN-REFUSED` |
+| The tractor more than 25 m out of the field with no such warning | `RAN-OFF` |
 
 Two operators:
 
@@ -55,7 +63,12 @@ Two operators:
   Tapada da Casa; the trailed 19-section seed drill on Baetas; a trailed 21 m cultivator on
   Couto Ribeira. Headland twice the implement wide, "Off outside boundary" on.
 - **Careless** (`CarelessOperator.cs`): the same jobs with one thing wrong or done at the wrong
-  moment.
+  moment. C8 sets look-ahead 1 s longer than the valves; C16 sets it to 0 s with the same
+  valves (AgOpenWeb's default before it took AgOpenGPS's 1.0 s / 0.5 s).
+
+When AgOpenWeb says "No U-turn fits inside the boundary at this end - take over manually", the
+operator takes over and the job stops (`TURN-REFUSED`), as a person would; before, AutoSteer
+was left to drive on and the job ended as a run-off.
 
 ## Running
 
@@ -67,6 +80,11 @@ A job is a field driven at about 12x real time: a few minutes for the small fiel
 minutes for the whole set. CI only builds it; the full run is nightly on develop
 (`.github/workflows/field-job-scenarios.yml`, also run by hand from Actions). The report goes
 to `field-job-scenarios-report.md` in the test output folder, or to `AGOPENWEB_SCENARIO_REPORT`.
+
+**One run at a time per machine.** The emulated module binds UDP 8888, so two runs side by side
+hear each other's section commands and both measure wrong valves without an error. A second run,
+field jobs or path jobs, fails at once on a lock file (`agopenweb-field-job-scenarios.lock` in the
+temp folder) that both fixtures take.
 
 | Variable | Effect |
 |---|---|
@@ -81,3 +99,51 @@ to `field-job-scenarios-report.md` in the test output folder, or to `AGOPENWEB_S
 The tests fail only when the harness itself breaks. The findings are the product: the report
 lists each kind once, most serious first, then each job with what was measured and its
 timeline.
+
+## Path jobs: curves, laps, a water pivot, contour, a recorded path
+
+`PathJobScenarioTests` runs the same rig on lines that are not straight (`PathJobs.cs`), with
+the careful operator, the Case Puma and the 8 m mounted sprayer:
+
+| Job | Field | Line |
+|---|---|---|
+| P1 | Olival | Boundary Curve: the outer boundary as a closed loop, no headland, worked lap by lap from the outside in |
+| P2 | Olival | Bnd. Curve along the west boundary (vertices 20 to 33, the narrow south-western end), headland 16 m, U-turns |
+| P3 | Pivot | Water pivot from the tower's lat/lon |
+| P4 | Pivot | Water pivot recorded by driving a third of the outer circle |
+| P5 | Pivot | Contour: the outer circle by hand, then Contour and AutoSteer |
+| P6 | Olival | Contour |
+| P7 | Olival | Record Path by hand, then play it back with AutoSteer |
+
+`Pivot` is made up, not a real field: a circle of 150 m round a pivot tower whose 4 m pad is an
+obstacle (`ScenarioFields.Pivot`).
+
+Each line has its own pass frame (`PassFrame.cs`: straight, polyline, circle), so the checks
+measure across and along the passes as on an AB line. Where AgOpenWeb makes no U-turn (a closed
+loop, a pivot, contour) the operator (`PathOperators.cs`) taps "move one pass" (or, on contour,
+takes the wheel and moves a width in) at the end of each lap, waits for AutoSteer to settle on
+the new pass, and stops when no lap is left: when the ground deep enough for the next lap is
+gone, or falls into pieces one closed line cannot go round (`DepthGrid`). What no lap reaches is
+counted apart (left for an AB line or by hand), and so are the laps' corners, where an inner lap
+pulls away from the outer one. AgOpenWeb's clock runs on the job's simulated time (`SimClock.cs`):
+contour rebuilds its line every 2 s of it.
+
+Findings these jobs add:
+
+| Check | Finding |
+|---|---|
+| The implement off the pass it should be on (the reference offset by whole widths) | `OFF-ITS-PASS` |
+| "Move one pass" refused, or AutoSteer never settling on the next lap | `LAP-CHANGE-REFUSED`, `LAP-CHANGE-NOT-SETTLED` |
+| The pivot circle away from the tower or the field's edge | `PIVOT-CIRCLE-OFF` |
+| AgOpenWeb's lap line running out of the field (checked before each lap, as the operator sees it) | `LAP-LINE-LEAVES-FIELD` |
+| Contour not engaging, its line lost, or AutoSteer taking the tractor off the lap it follows | `CONTOUR-NOT-ENGAGED`, `CONTOUR-LINE-LOST`, `CONTOUR-LEFT-THE-LAP` |
+| A recorded route not played, not followed, or not finished | `RECORDED-PATH-NOT-PLAYED`, `RECORDED-PATH-NOT-FOLLOWED`, `RECORDED-PATH-NOT-DONE` |
+| With no headland, the strip along the boundary never sprayed | `EDGE-NOT-SPRAYED` |
+
+```bash
+dotnet test Tests/AgOpenWeb.FieldJobScenarios.Tests/ --filter "FullyQualifiedName~PathJobScenarioTests"
+```
+
+About half an hour for the seven jobs; nightly on develop (`.github/workflows/path-job-scenarios.yml`, started by the bug report Worker as the other harnesses).
+The same variables pick jobs (`AGOPENWEB_SCENARIO_ONLY=P1,P3`), trace and dump; the report goes
+to `path-job-scenarios-report.md`, or to `AGOPENWEB_SCENARIO_REPORT`.
