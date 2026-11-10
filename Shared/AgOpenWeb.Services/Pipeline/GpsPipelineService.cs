@@ -1007,6 +1007,18 @@ public sealed class GpsPipelineService : IGpsPipelineService
         _isOutOfBounds = OutOfBounds(boundary, headlandLine, youTurnEnabled && hasValidHeadlandLine,
             driftedEasting, driftedNorthing);
 
+        // (5a) A dual heading across the direction of travel: its offset doesn't match how
+        // the antennas are mounted (front to back set up as side by side). Guidance would
+        // steer for a tractor driving across its line, and the tractor leaves the pass.
+        // Also on the simulator, which takes the offset too.
+        if (autoSteerEngaged && _headingFusion.IsDualHeadingOffTravel)
+        {
+            autoSteerEngaged = false;
+            autoSteerDisengaged = true;
+            disengageReason = "AutoSteer disengaged - " + DualHeadingOffTravelText(_headingFusion.DualHeadingOffTravelDeg);
+            lock (_stateLock) _autoSteerEngaged = false;
+        }
+
         // (5b) Steering speed limits (#106) — like AgOpenGPS, and like it not on the simulator.
         if (autoSteerEngaged && !simulatorEnabled)
         {
@@ -1428,6 +1440,8 @@ public sealed class GpsPipelineService : IGpsPipelineService
             ImuValid = data.ImuValid,
             IsReverse = _isReverse,
             IsDualHeadingMissing = _headingFusion.IsDualHeadingMissing,
+            IsDualHeadingOffTravel = _headingFusion.IsDualHeadingOffTravel,
+            DualHeadingOffTravelDeg = _headingFusion.DualHeadingOffTravelDeg,
 
             // Tool position
             ToolEasting = toolPos.Easting,
@@ -1468,6 +1482,10 @@ public sealed class GpsPipelineService : IGpsPipelineService
             // Headland proximity
             HeadlandProximityDistance = headlandDist,
             HeadlandProximityWarning = headlandWarning,
+
+            // Contour: a stretch ahead that can't be driven as a lap
+            ContourAhead = (byte)_contourAhead.What,
+            ContourAheadM = _contourAhead.AtM,
 
             // Phase E: first-fix LocalPlane auto-create — non-null only on
             // the single cycle where the cycle bootstrapped the plane.
@@ -1842,9 +1860,34 @@ public sealed class GpsPipelineService : IGpsPipelineService
             }
             _contourLockedShown = contourOn && _contour.IsLocked;
             _contourHasPending = _contour.PendingSave.Count > 0;
+
+            // Look along the line ahead for a stretch that can't be driven as a lap, early enough
+            // for the operator to take over; the alarm sounds once as it appears.
+            // Checked again when the line changes or the tractor has moved a metre.
+            if (!contourOn || _contour.Line.Count < 3)
+            {
+                _contourAhead = (ContourAhead.Clear, 0);
+                _contourAheadVersion = -1;
+            }
+            else if (_contour.LineVersion != _contourAheadVersion
+                || Math.Abs(pivotE - _contourAheadPos.Easting) + Math.Abs(pivotN - _contourAheadPos.Northing) > 1)
+            {
+                _contourAheadVersion = _contour.LineVersion;
+                _contourAheadPos = new Vec2(pivotE, pivotN);
+                var ahead = ContourAheadCheck.Check(_contour.Line, _contourAheadPos, headingRad,
+                    ContourAheadCheck.Reach(speedKmh), _isPointCovered, config.Guidance.UTurnRadius);
+                if (ahead.What != ContourAhead.Clear && _contourAhead.What != ahead.What && autoSteerEngaged)
+                    _audioService.Play(SoundEffect.BoundaryAlarm);
+                _contourAhead = ahead;
+            }
         }
         return steer;
     }
+
+    /// <summary>What the contour line ahead holds (<see cref="ContourAheadCheck"/>), and how far ahead.</summary>
+    private (ContourAhead What, double AtM) _contourAhead;
+    private int _contourAheadVersion = -1;
+    private Vec2 _contourAheadPos;
 
     private ContourParams ContourParamsFor(double speedKmh)
     {
@@ -2416,6 +2459,13 @@ public sealed class GpsPipelineService : IGpsPipelineService
     internal Func<long> NowMs { get; set; } = () => Environment.TickCount64;
     private long? _belowMinSteerSpeedSinceMs;
     private const long BelowMinSteerSpeedGraceMs = 8000; // AgOpenGPS: 80 frames at 10 Hz
+
+    /// <summary>Why AutoSteer won't steer with a dual heading that runs across the direction of
+    /// travel (<see cref="IGpsHeadingFusionService.IsDualHeadingOffTravel"/>), for the toast.</summary>
+    public static string DualHeadingOffTravelText(double offDeg) =>
+        string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "the dual antenna heading is {0:F0}° off the direction of travel: check its Heading offset (GPS tab)",
+            double.IsFinite(offDeg) ? offDeg : 90);
 
     /// <summary>
     /// AgOpenGPS steering speed limits: above Max steer speed disengages at once; below Min
