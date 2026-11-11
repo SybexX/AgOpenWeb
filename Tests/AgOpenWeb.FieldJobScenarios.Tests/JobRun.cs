@@ -224,6 +224,21 @@ public sealed class JobRun : IAsyncDisposable
     /// <summary>The operator stopped the job because AgOpenWeb went wrong (a finding says how):
     /// the ground left is its consequence, not judged again.</summary>
     public bool EndedEarly;
+    /// <summary>A short run: stop at the start of U-turn N+1 (the Nth turn and the pass after it
+    /// driven), or after N simulated minutes. 0 = the whole job (the nightly).</summary>
+    /// <summary>Start on this pass (AgOpenWeb's pass number, as the reports give it) instead of the
+    /// first along the edge; int.MinValue = the first. The passes before it stay unworked, so the
+    /// run ends as an early end does (the whole-field checks are not made).</summary>
+    public static readonly int FromPass = int.TryParse(Environment.GetEnvironmentVariable("AGOPENWEB_SCENARIO_FROM_PASS"), out var fp) ? fp : int.MinValue;
+    public int StartedAtPass = int.MinValue;
+    /// <summary>The run was stopped short (AGOPENWEB_SCENARIO_TURNS / _MINUTES): a check that waits for a
+    /// later turn notes it was not reached rather than reporting it lost.</summary>
+    public bool ShortStopped;
+    /// <summary>When the turn dropped at a short stop had started (NaN: none): a manual tap that started
+    /// it is not judged.</summary>
+    public double DroppedTurnAt = double.NaN;
+    public static readonly int ShortTurns = int.TryParse(Environment.GetEnvironmentVariable("AGOPENWEB_SCENARIO_TURNS"), out var st) ? st : 0;
+    public static readonly double ShortMinutes = double.TryParse(Environment.GetEnvironmentVariable("AGOPENWEB_SCENARIO_MINUTES"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sm) ? sm : 0;
     /// <summary>False = the receiver sends nothing (a careless operator's GPS loss).</summary>
     public volatile bool GpsOn = true;
     public int Pass = int.MinValue;
@@ -519,6 +534,16 @@ public sealed class JobRun : IAsyncDisposable
         int dir = Spec.T.Offset > 0 && !Spec.EdgePass ? -1 : 1;
         double TractorU(int i) => (i + 0.5) * Spacing - Spec.T.Offset * dir;
         for (k = kMin; k <= kMax && (InsideChordM(k) < 20 || (!Spec.EdgePass && Spec.T.Offset != 0 && InsideChordAtU(TractorU(k)) < 20)); k++) { }
+        // A run from a pass on (AGOPENWEB_SCENARIO_FROM_PASS): the tractor starts on that pass,
+        // driven the way the whole job would drive it (the passes alternate), the passes before it
+        // left unworked. With AGOPENWEB_SCENARIO_TURNS it reworks a few passes where a finding was.
+        if (FromPass != int.MinValue && FromPass > k)
+        {
+            if (((FromPass - k) & 1) == 1) dir = -dir;
+            Journal.Trace(F($"[fj] started at pass {FromPass} (AGOPENWEB_SCENARIO_FROM_PASS), not {k}"));
+            k = FromPass;
+            StartedAtPass = FromPass;
+        }
         if (k > kMin && Spec.T.Offset != 0)
             for (int i = kMin; i < k; i++)
                 if (InsideChordM(i) >= 20) Journal.Trace(F($"[fj] pass {i} skipped at the start: the implement's line has {InsideChordM(i):0} m in the cultivated area, the tractor's {InsideChordAtU(TractorU(i)):0} m"));
@@ -563,6 +588,12 @@ public sealed class JobRun : IAsyncDisposable
         var (pivot, hdg, k0) = StartPose();
         Truth.Place(pivot.E, pivot.N, hdg);
         S.Step(F($"tractor put at the start of pass {k0} ({pivot.E:0},{pivot.N:0}), 12 m before the boundary, heading {(hdg * 180 / Math.PI + 360) % 360:0}°"));
+        if (StartedAtPass != int.MinValue)
+        {
+            EndedEarly = true;
+            EndedBy = F($"a run from pass {StartedAtPass} on (AGOPENWEB_SCENARIO_FROM_PASS), the passes before it not worked");
+            Did(EndedBy);
+        }
         for (int i = 0; i < 30; i++) { Truth.Advance(FixSeconds, 0); SendFix(); await Task.Delay(PaceMs); }
         await Rig.WaitForVmAsync();
         await SendAsync("autosteer.toggle");
@@ -586,6 +617,20 @@ public sealed class JobRun : IAsyncDisposable
         var prevOpen = 0UL;
         while (Fix < maxFixes && !Stopped)
         {
+            // A short run (AGOPENWEB_SCENARIO_TURNS / _MINUTES): to confirm a fix on the first
+            // passes without driving the whole field. It ends as an early end does, so the
+            // checks that need the whole field are not made; the report says so.
+            if ((ShortTurns > 0 && TurnsStarted > ShortTurns) || (ShortMinutes > 0 && Seconds >= ShortMinutes * 60))
+            {
+                EndedBy = (EndedBy.Length > 0 ? EndedBy + "; " : "") + (ShortTurns > 0 && TurnsStarted > ShortTurns
+                    ? F($"a short run, stopped after {ShortTurns} U-turn(s) (AGOPENWEB_SCENARIO_TURNS)")
+                    : F($"a short run, stopped after {ShortMinutes} min (AGOPENWEB_SCENARIO_MINUTES)"));
+                // The turn that had just started never finished: not judged as a turn.
+                if (InTurn && Turns.Count > 0 && Turns[^1].Index == TurnsStarted) { DroppedTurnAt = Turns[^1].StartSeconds; Turns.RemoveAt(Turns.Count - 1); InTurn = false; }
+                ShortStopped = true;
+                EndedEarly = true; Stopped = true; Did(EndedBy);
+                break;
+            }
             Fix++;
             SimMs += 100;
             Truth.Advance(FixSeconds, cmd);
@@ -917,6 +962,7 @@ public sealed class JobRun : IAsyncDisposable
         bool link = Module.LinkOk;
         if (!link) SecondsLinkDown += FixSeconds;
         var ss = c.SectionStates;
+        var live = Rig.Services.GetRequiredService<ISectionControlService>().SectionStates;
         Grid.BeginFix();
         double uL = double.MaxValue, uR = double.MinValue;
         bool any = false;
@@ -933,7 +979,10 @@ public sealed class JobRun : IAsyncDisposable
             // What must match the screen is the product at the nozzles: the relays rightly lead the
             // screen by the look-ahead (#714), the valves then take that long, and the two meet.
             bool valve = ((spray >> s) & 1) != 0;
-            bool screen = ss != null && s < ss.Length && ss[s];
+            // The screen as the browser draws it: the section service's live state, which the
+            // 100 Hz control loop keeps up without GPS. The last GPS cycle's copy stays as it was
+            // through an outage (careless C2: 'on' for 5 s while the app had closed the valves).
+            bool screen = s < live.Count && live[s].IsOn;
             if (screen && !valve) { ScreenOnValveShut[s] += FixSeconds; if (!link) SecondsPaintingLinkDown += FixSeconds / n; }
             if (!screen && valve) ScreenOffValveOpen[s] += FixSeconds;
             if (screen != valve) { if (++_disagreeRun[s] > 10) PersistentDisagreement[s] += FixSeconds; }
@@ -1064,6 +1113,7 @@ public sealed class JobRun : IAsyncDisposable
         double cell = TruthGrid.Cell * TruthGrid.Cell;
         var g = Grid;
         int reach = (int)Math.Ceiling(1.5 * Spacing / TruthGrid.Cell);
+        double widestSection = Enumerable.Range(0, Spec.T.Sections).Max(k => Spec.T.SectionCm(k)) / 100.0;
         // The seams between neighbouring passes where both ran at full width, by 1 m bin along
         // the line: where the gap between them lies across the passes, and how wide it is.
         var seams = new Dictionary<int, List<(double Mid, double Gap)>>();
@@ -1106,10 +1156,12 @@ public sealed class JobRun : IAsyncDisposable
                     if (Work != null && Ring.DistToRing(c, Work) < 3) a.MissedAtEnds += cell;
                     // Within 2 m of an obstacle: the sections closing over it and opening again.
                     else if (g.Near(i, j => (g.Zone[j] & (TruthGrid.InObstacle | TruthGrid.InDriveThrough)) != 0, 10)) a.MissedAtObstacles += cell;
+                    // The laps' corners first: a lap rounds a corner of the boundary and cannot reach
+                    // into it, whatever the sections do (near the fence too).
+                    else if (AtCorner?.Invoke(c) == true) a.MissedAtCorners += cell;
                     // No headland (the lap jobs): the edge of the field along the boundary.
                     else if (Work == null && Ring.DistToRing(c, Outer) < 1.5) a.MissedAlongBoundary += cell;
                     else if (LeftOnPurpose?.Invoke(c) == true) a.MissedLeftInMiddle += cell;
-                    else if (AtCorner?.Invoke(c) == true) a.MissedAtCorners += cell;
                     else if (SprayedAcross(i, +1, reach) && SprayedAcross(i, -1, reach)) { a.MissedBetweenPasses += cell; a.MissedBetweenE += c.E * cell; a.MissedBetweenN += c.N * cell; if (OnSeam(c)) a.MissedAtSeams += cell; }
                     // The rest: in a pass that was driven (worked along part of its length, as the
                     // first passes of a field whose corner a U-turn cut off), or in no driven pass
@@ -1124,7 +1176,13 @@ public sealed class JobRun : IAsyncDisposable
                 if ((z & TruthGrid.InOuter) == 0) a.OutsideBoundary += cell;
                 else if ((z & TruthGrid.InObstacle) != 0) a.InObstacles += cell;
                 else if ((z & TruthGrid.InDriveThrough) != 0) a.InDriveThrough += cell;
-                else if ((z & TruthGrid.InWork) == 0) a.InHeadland += cell;
+                else if ((z & TruthGrid.InWork) == 0)
+                {
+                    a.InHeadland += cell;
+                    // A section is in the headland only with both ends in it (AgOpenGPS), so where
+                    // a pass meets the line at an angle up to a section's width goes past the line.
+                    if (Work != null && Ring.DistToRing(c, Work) > widestSection + TruthGrid.Cell) a.InHeadlandPastSection += cell;
+                }
                 if (!app && !g.Near(i, j => Coverage.IsPointCovered(g.Centre(j).E, g.Centre(j).N), 2)) a.SprayedNotAppPainted += cell;
             }
             if (app && !truth && !g.Near(i, j => g.Count[j] > 0, 2))
